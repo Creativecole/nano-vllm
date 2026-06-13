@@ -14,29 +14,53 @@ A lightweight vLLM implementation built from scratch.
 
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Triton kernels, CUDA graph, etc.
+* 🧪 **Blackwell FP8 KV Cache** - Experimental RTX 5090-oriented FP8 E4M3 paged KV cache path
 
 ## Installation
 
+For local development, clone this fork and install it in editable mode:
+
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+git clone https://github.com/Creativecole/nano-vllm.git
+cd nano-vllm
+pip install -e .
 ```
+
+Or install directly from this fork:
+
+```bash
+pip install git+https://github.com/Creativecole/nano-vllm.git
+```
+
+For the FP8 KV cache experiments, use a CUDA environment with PyTorch, Triton, and a FlashAttention build
+whose `flash_attn_with_kvcache` exposes `k_descale` / `v_descale`. On unsupported GPUs or FlashAttention
+builds, `kv_cache_dtype="auto"` falls back to the normal BF16 KV cache.
 
 ## Model Download
 
-To download the model weights manually, use the following command:
+To download the Qwen3-0.6B example model manually, use:
+
 ```bash
 huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
   --local-dir ~/huggingface/Qwen3-0.6B/ \
   --local-dir-use-symlinks False
 ```
 
+Larger compatible dense Qwen3/Qwen3.5 CausalLM checkpoints can also be used by passing their local
+directory to `LLM`, for example `/path/to/Qwen3.5-9B`.
+
 ## Quick Start
 
 See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
 ```python
 from nanovllm import LLM, SamplingParams
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
+llm = LLM(
+    "/YOUR/MODEL/PATH",
+    enforce_eager=True,
+    tensor_parallel_size=1,
+    kv_cache_dtype="auto",
+)
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
 prompts = ["Hello, Nano-vLLM."]
 outputs = llm.generate(prompts, sampling_params)
