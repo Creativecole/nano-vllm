@@ -29,12 +29,16 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
+        self._exited = False
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
     def exit(self):
+        if self._exited:
+            return
+        self._exited = True
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
