@@ -117,7 +117,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
-    kv_cache_dtype: str = "auto"
+    kv_cache_dtype: str = "bf16"
     kv_cache_scale: float = 1.0
     resolved_kv_cache_dtype: str = "bf16"
     hf_config: AutoConfig | None = None

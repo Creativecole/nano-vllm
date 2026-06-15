@@ -4,10 +4,7 @@ import triton
 import triton.language as tl
 from inspect import signature
 
-try:
-    from flash_attn_interface import flash_attn_varlen_func, flash_attn_with_kvcache
-except ImportError:
-    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 
 

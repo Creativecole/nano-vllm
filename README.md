@@ -15,7 +15,7 @@ A lightweight vLLM implementation built from scratch.
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
 * ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Triton kernels, CUDA graph, etc.
-* 🧪 **Blackwell FP8 KV Cache** - Experimental RTX 5090-oriented FP8 E4M3 paged KV cache path
+* 🧪 **RTX 5090 Triton Benchmarks** - Benchmark-driven kernel work with correctness checks and measured speedups
 
 ## Installation
 
@@ -33,9 +33,9 @@ Or install directly from this fork:
 pip install git+https://github.com/Creativecole/nano-vllm.git
 ```
 
-For the FP8 KV cache experiments, use a CUDA environment with PyTorch, Triton, and a FlashAttention build
-whose `flash_attn_with_kvcache` exposes `k_descale` / `v_descale`. On unsupported GPUs or FlashAttention
-builds, `kv_cache_dtype="auto"` falls back to the normal BF16 KV cache.
+This fork keeps the default serving path on FlashAttention 2 and BF16 KV cache for reproducible results.
+Experimental FP8 KV-cache code is kept behind `kv_cache_dtype="fp8_e4m3"` and requires a FlashAttention
+build whose `flash_attn_with_kvcache` exposes `k_descale` / `v_descale`.
 
 ## Model Download
 
@@ -47,8 +47,9 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
   --local-dir-use-symlinks False
 ```
 
-Larger compatible dense Qwen3/Qwen3.5 CausalLM checkpoints can also be used by passing their local
-directory to `LLM`, for example `/path/to/Qwen3.5-9B`.
+Larger compatible dense Qwen3 CausalLM checkpoints can also be used by passing their local directory to
+`LLM`, for example `/path/to/Qwen3-4B`. Hybrid checkpoints with `linear_attn` weights need a separate
+model adapter and are intentionally rejected by this fork.
 
 ## Quick Start
 
@@ -59,7 +60,7 @@ llm = LLM(
     "/YOUR/MODEL/PATH",
     enforce_eager=True,
     tensor_parallel_size=1,
-    kv_cache_dtype="auto",
+    kv_cache_dtype="bf16",
 )
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
 prompts = ["Hello, Nano-vLLM."]
@@ -84,51 +85,45 @@ See `bench.py` for benchmark.
 | vLLM           | 133,966     | 98.37    | 1361.84               |
 | Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
 
-## Blackwell / RTX 5090 FP8 KV Cache Work
+## RTX 5090 Triton Kernel Work
 
-This fork includes an experimental FP8 KV cache path intended for Blackwell-class GPUs such as RTX 5090.
-It keeps the normal BF16 path as the default fallback and enables FP8 automatically only when the GPU and
-FlashAttention build expose the required FP8 KV-cache descale interface.
+This fork focuses on measurable Triton kernel work first: every replacement path is checked against a
+PyTorch or torch.compile baseline before being used as a default. The current RTX 5090 / Qwen3-0.6B
+microbenchmarks show clear wins for normalization and activation kernels, while KV-cache store variants
+and GEMV experiments are kept out of the default path when they do not beat the baseline.
 
-```python
-from nanovllm import LLM
+Measured on RTX 5090 with `python bench_kernels.py --min-run-time 1.0 --skip-sampler`:
 
-llm = LLM(
-    "/YOUR/MODEL/PATH",
-    kv_cache_dtype="auto",      # "bf16", "fp8_e4m3", or "auto"
-    kv_cache_scale=1.0,         # static per-layer/per-KV-head scale, v1 default
-)
-```
-
-What is implemented:
-
-* FP8 E4M3 paged KV cache allocation with `auto` / `bf16` / `fp8_e4m3` configuration.
-* Fused Triton BF16-to-FP8 KV store kernel with per-layer, per-KV-head static scales.
-* FlashAttention KV-cache decode integration that passes `k_descale` / `v_descale` when available.
-* Correctness tests for Triton kernels and opt-in integration tests for BF16 vs FP8 generation.
-* Reproducible scripts for KV-cache capacity, decode throughput, FP8 GEMM exploration, and TMA feasibility.
-
-Known v1 boundary: FP8 KV cache currently targets decode. Prefix-cache prefill with reused cached blocks
-requires a separate FP8-aware varlen attention path and is intentionally rejected instead of silently
-falling back to an incorrect path.
+| Kernel | Baseline | Triton result | Default decision |
+|---|---|---:|---|
+| RMSNorm | torch.compile | up to 2.95x faster | Enabled |
+| Add + RMSNorm | torch.compile | up to 2.21x faster | Enabled |
+| SiLU-and-Mul | torch.compile | up to 1.83x faster | Enabled |
+| RoPE | torch.compile | up to 1.18x faster | Enabled |
+| KV-cache store 2D grid | 1D Triton store | ~0.84-0.86x | Experimental only |
+| Linear GEMV | `torch.nn.functional.linear` / cuBLAS | ~0.27-0.36x | Disabled by default |
 
 Useful commands:
 
 ```bash
 pytest tests/test_kernels.py
-NANOVLLM_TEST_MODEL=/path/to/Qwen3-0.6B pytest tests/test_fp8_integration.py
-python bench_kernels.py --min-run-time 1.0 --skip-sampler
+python bench_kernels.py --min-run-time 1.0 --skip-sampler --output kernels_5090_qwen3_0.6b.md
 python bench_fp8_kvcache.py --model /path/to/Qwen3-0.6B --max-model-len 4096
-python bench_fp8_gemm.py
-python experiments/tma_kvcache_spike.py
 ```
 
-`bench_kernels.py` compares the Triton kernels against their original torch.compile / eager baselines
-and prints a Markdown summary table with median latency, speedup, and correctness status.
+`bench_kernels.py` prints a Markdown summary table with median latency, speedup, and correctness status.
+The benchmark is meant to document both successful kernel substitutions and negative results, which keeps
+the default inference path conservative.
 
-For resume reporting, capture the BF16 vs FP8 KV block count, generated tokens/s, peak memory, and
-inter-token latency slope across context lengths. The expected headline is that FP8 halves KV-cache
-storage per token, so the allocated KV block count should approach 2x when KV cache dominates free memory.
+## Experimental FP8 KV Cache
+
+FP8 KV cache remains an explicit research path instead of a default feature. To use it, pass
+`kv_cache_dtype="fp8_e4m3"` and run on a PyTorch / FlashAttention stack where the decode kernel exposes
+`k_descale` and `v_descale`. If that interface is missing, nano-vLLM raises a clear error instead of
+silently running an incorrect FP8 path.
+
+Future work includes validating FP8 KV cache on a compatible FlashAttention 3 build, FP8 GEMM
+microbenchmarks, and TMA experiments for paged KV-cache memory movement.
 
 
 ## Star History
