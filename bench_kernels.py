@@ -4,8 +4,16 @@ Run on GPU: python bench_kernels.py
 
 Compares the original torch.compile implementations against
 the new Triton kernel implementations for each optimized layer.
+
+Use this as microbenchmark evidence, not as a substitute for end-to-end
+throughput tests. Most kernels are intended to be numerically equivalent
+to the original implementation; the top-k sampler benchmark is an
+intentional optional approximation and should not be presented as the
+default sampler's semantic-equivalent replacement.
 """
 
+import argparse
+from pathlib import Path
 import torch
 import torch.nn.functional as F
 import torch.utils.benchmark as benchmark
@@ -16,6 +24,8 @@ import torch.distributed as dist
 
 # Initialize a single-GPU process group for the linear layers
 dist.init_process_group("gloo", rank=0, world_size=1)
+
+SUMMARY = []
 
 
 def bench(fn, label, sub_label, description, min_run_time=2.0):
@@ -29,7 +39,29 @@ def bench(fn, label, sub_label, description, min_run_time=2.0):
     ).blocked_autorange(min_run_time=min_run_time)
 
 
-def benchmark_layernorm():
+def add_summary(kernel, shape, baseline_name, triton_name, baseline_result, triton_result, correctness="pass", notes=""):
+    baseline_us = baseline_result.median * 1e6
+    triton_us = triton_result.median * 1e6
+    speedup = baseline_us / triton_us if triton_us else float("inf")
+    SUMMARY.append({
+        "kernel": kernel,
+        "shape": shape,
+        "baseline": baseline_name,
+        "triton": triton_name,
+        "baseline_us": baseline_us,
+        "triton_us": triton_us,
+        "speedup": speedup,
+        "correctness": correctness,
+        "notes": notes,
+    })
+
+
+def assert_close(name, actual, expected, rtol=2e-2, atol=2e-2):
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=rtol, atol=atol)
+    return "pass"
+
+
+def benchmark_layernorm(min_run_time):
     """Benchmark RMSNorm: original torch.compile vs Triton kernel."""
     print("\n" + "=" * 70)
     print("BENCHMARK 1: RMSNorm (layernorm.py)")
@@ -82,24 +114,31 @@ def benchmark_layernorm():
             new(x.clone())
 
         # rms_forward
-        r1 = bench(lambda: orig.rms_forward(x.clone()), "RMSNorm", f"N={N}", "torch.compile")
-        r2 = bench(lambda: new(x.clone()), "RMSNorm", f"N={N}", "Triton")
+        correctness = assert_close("RMSNorm", new(x.clone()), orig.rms_forward(x.clone()))
+        r1 = bench(lambda: orig.rms_forward(x.clone()), "RMSNorm", f"N={N}", "torch.compile", min_run_time)
+        r2 = bench(lambda: new(x.clone()), "RMSNorm", f"N={N}", "Triton", min_run_time)
         results.extend([r1, r2])
+        add_summary("RMSNorm", f"N={N},D={hidden_size}", "torch.compile", "Triton", r1, r2, correctness)
 
         # warmup add_rms
         for _ in range(3):
             orig.add_rms_forward(x.clone(), residual.clone())
             new(x.clone(), residual.clone())
 
-        r3 = bench(lambda: orig.add_rms_forward(x.clone(), residual.clone()), "AddRMSNorm", f"N={N}", "torch.compile")
-        r4 = bench(lambda: new(x.clone(), residual.clone()), "AddRMSNorm", f"N={N}", "Triton")
+        new_out, new_res = new(x.clone(), residual.clone())
+        orig_out, orig_res = orig.add_rms_forward(x.clone(), residual.clone())
+        assert_close("AddRMSNorm output", new_out, orig_out)
+        correctness = assert_close("AddRMSNorm residual", new_res, orig_res)
+        r3 = bench(lambda: orig.add_rms_forward(x.clone(), residual.clone()), "AddRMSNorm", f"N={N}", "torch.compile", min_run_time)
+        r4 = bench(lambda: new(x.clone(), residual.clone()), "AddRMSNorm", f"N={N}", "Triton", min_run_time)
         results.extend([r3, r4])
+        add_summary("AddRMSNorm", f"N={N},D={hidden_size}", "torch.compile", "Triton", r3, r4, correctness)
 
     compare = benchmark.Compare(results)
     compare.print()
 
 
-def benchmark_activation():
+def benchmark_activation(min_run_time):
     """Benchmark SiluAndMul: original torch.compile vs Triton kernel."""
     print("\n" + "=" * 70)
     print("BENCHMARK 2: SiluAndMul (activation.py)")
@@ -130,15 +169,17 @@ def benchmark_activation():
             orig(x.clone())
             new(x.clone())
 
-        r1 = bench(lambda: orig(x.clone()), "SiluAndMul", f"N={N}", "torch.compile")
-        r2 = bench(lambda: new(x.clone()), "SiluAndMul", f"N={N}", "Triton")
+        correctness = assert_close("SiluAndMul", new(x.clone()), orig(x.clone()))
+        r1 = bench(lambda: orig(x.clone()), "SiluAndMul", f"N={N}", "torch.compile", min_run_time)
+        r2 = bench(lambda: new(x.clone()), "SiluAndMul", f"N={N}", "Triton", min_run_time)
         results.extend([r1, r2])
+        add_summary("SiluAndMul", f"N={N},D={intermediate_size}", "torch.compile", "Triton", r1, r2, correctness)
 
     compare = benchmark.Compare(results)
     compare.print()
 
 
-def benchmark_rotary():
+def benchmark_rotary(min_run_time):
     """Benchmark RotaryEmbedding: original torch.compile vs Triton kernel."""
     print("\n" + "=" * 70)
     print("BENCHMARK 3: RotaryEmbedding (rotary_embedding.py)")
@@ -193,15 +234,20 @@ def benchmark_rotary():
             orig(positions, q.clone(), k.clone())
             new(positions, q.clone(), k.clone())
 
-        r1 = bench(lambda: orig(positions, q.clone(), k.clone()), "RoPE", f"N={N}", "torch.compile")
-        r2 = bench(lambda: new(positions, q.clone(), k.clone()), "RoPE", f"N={N}", "Triton")
+        new_q, new_k = new(positions, q.clone(), k.clone())
+        orig_q, orig_k = orig(positions, q.clone(), k.clone())
+        assert_close("RoPE q", new_q, orig_q)
+        correctness = assert_close("RoPE k", new_k, orig_k)
+        r1 = bench(lambda: orig(positions, q.clone(), k.clone()), "RoPE", f"N={N}", "torch.compile", min_run_time)
+        r2 = bench(lambda: new(positions, q.clone(), k.clone()), "RoPE", f"N={N}", "Triton", min_run_time)
         results.extend([r1, r2])
+        add_summary("RoPE", f"N={N},QH={num_heads},KVH={num_kv_heads},D={head_dim}", "torch.compile", "Triton", r1, r2, correctness)
 
     compare = benchmark.Compare(results)
     compare.print()
 
 
-def benchmark_kvcache():
+def benchmark_kvcache(min_run_time):
     """Benchmark store_kvcache: original 1D grid vs new 2D grid."""
     print("\n" + "=" * 70)
     print("BENCHMARK 4: store_kvcache (attention.py)")
@@ -248,22 +294,31 @@ def benchmark_kvcache():
         value = torch.randn(N, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
         k_cache = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
         v_cache = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
+        k_cache_ref = torch.zeros_like(k_cache)
+        v_cache_ref = torch.zeros_like(v_cache)
         slot_mapping = torch.randint(0, num_blocks * block_size, (N,), device=device, dtype=torch.int32)
+
+        store_kvcache_old(key, value, k_cache_ref, v_cache_ref, slot_mapping)
+        store_kvcache_new(key, value, k_cache, v_cache, slot_mapping)
+        torch.cuda.synchronize()
+        assert_close("KVCache k", k_cache, k_cache_ref, rtol=0, atol=0)
+        correctness = assert_close("KVCache v", v_cache, v_cache_ref, rtol=0, atol=0)
 
         # warmup
         for _ in range(3):
             store_kvcache_old(key, value, k_cache, v_cache, slot_mapping)
             store_kvcache_new(key, value, k_cache, v_cache, slot_mapping)
 
-        r1 = bench(lambda: store_kvcache_old(key, value, k_cache, v_cache, slot_mapping), "KVCache", f"N={N}", "1D-grid")
-        r2 = bench(lambda: store_kvcache_new(key, value, k_cache, v_cache, slot_mapping), "KVCache", f"N={N}", "2D-grid")
+        r1 = bench(lambda: store_kvcache_old(key, value, k_cache, v_cache, slot_mapping), "KVCache", f"N={N}", "1D-grid", min_run_time)
+        r2 = bench(lambda: store_kvcache_new(key, value, k_cache, v_cache, slot_mapping), "KVCache", f"N={N}", "2D-grid", min_run_time)
         results.extend([r1, r2])
+        add_summary("KVCacheStore", f"N={N},KVH={num_kv_heads},D={head_dim}", "1D-grid", "2D-grid", r1, r2, correctness)
 
     compare = benchmark.Compare(results)
     compare.print()
 
 
-def benchmark_sampler():
+def benchmark_sampler(min_run_time):
     """Benchmark Sampler: original full-softmax vs top-k fused."""
     print("\n" + "=" * 70)
     print("BENCHMARK 5: Sampler (sampler.py)")
@@ -297,15 +352,25 @@ def benchmark_sampler():
                 orig(logits.clone(), temps)
                 new(logits.clone(), temps)
 
-            r1 = bench(lambda: orig(logits.clone(), temps), "Sampler", f"V={V},N={N}", "torch.compile")
-            r2 = bench(lambda: new(logits.clone(), temps), "Sampler", f"V={V},N={N}", "Triton top-k")
+            r1 = bench(lambda: orig(logits.clone(), temps), "Sampler", f"V={V},N={N}", "torch.compile full-softmax", min_run_time)
+            r2 = bench(lambda: new(logits.clone(), temps), "Sampler", f"V={V},N={N}", "Triton top-k", min_run_time)
             results.extend([r1, r2])
+            add_summary(
+                "SamplerTopK",
+                f"N={N},V={V},K=50",
+                "torch.compile full-softmax",
+                "Triton top-k",
+                r1,
+                r2,
+                correctness="n/a",
+                notes="optional approximation; not semantic-equivalent",
+            )
 
     compare = benchmark.Compare(results)
     compare.print()
 
 
-def benchmark_linear():
+def benchmark_linear(min_run_time):
     """Benchmark Linear: F.linear vs Triton GEMV for small batches."""
     print("\n" + "=" * 70)
     print("BENCHMARK 6: Linear GEMV (linear.py)")
@@ -333,15 +398,45 @@ def benchmark_linear():
                 F.linear(x, weight, bias)
                 triton_gemv(x, weight, bias)
 
-            r1 = bench(lambda: F.linear(x, weight, bias), f"Linear-{name}", f"M={M}", "cuBLAS")
-            r2 = bench(lambda: triton_gemv(x, weight, bias), f"Linear-{name}", f"M={M}", "Triton GEMV")
+            correctness = assert_close("Linear GEMV", triton_gemv(x, weight, bias), F.linear(x, weight, bias), rtol=2e-2, atol=2e-2)
+            r1 = bench(lambda: F.linear(x, weight, bias), f"Linear-{name}", f"M={M}", "cuBLAS", min_run_time)
+            r2 = bench(lambda: triton_gemv(x, weight, bias), f"Linear-{name}", f"M={M}", "Triton GEMV", min_run_time)
             results.extend([r1, r2])
+            add_summary(f"Linear-{name}", f"M={M},K={K},N={N}", "cuBLAS F.linear", "Triton GEMV", r1, r2, correctness)
 
     compare = benchmark.Compare(results)
     compare.print()
 
 
+def print_summary():
+    print("\n" + "=" * 70)
+    print("Markdown summary table")
+    print("=" * 70)
+    lines = [
+        "| Kernel | Shape | Baseline | Triton | Speedup | Correctness | Notes |",
+        "|---|---|---:|---:|---:|---|---|",
+    ]
+    for row in SUMMARY:
+        lines.append(
+            f"| {row['kernel']} | {row['shape']} | "
+            f"{row['baseline_us']:.2f} us | {row['triton_us']:.2f} us | "
+            f"{row['speedup']:.2f}x | {row['correctness']} | {row['notes']} |"
+        )
+    text = "\n".join(lines)
+    print(text)
+    return text
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Benchmark Triton kernels against original torch.compile/eager baselines.")
+    parser.add_argument("--min-run-time", type=float, default=2.0)
+    parser.add_argument("--skip-sampler", action="store_true", help="Skip the expensive full-vocab sampler benchmark.")
+    parser.add_argument("--output", type=str, default=None, help="Optional path to save the final Markdown summary table.")
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is required for bench_kernels.py")
+
     torch.set_default_device("cuda")
 
     print("=" * 70)
@@ -351,12 +446,19 @@ if __name__ == "__main__":
     print(f"PyTorch: {torch.__version__}")
     print(f"CUDA: {torch.version.cuda}")
 
-    benchmark_layernorm()
-    benchmark_activation()
-    benchmark_rotary()
-    benchmark_kvcache()
-    benchmark_sampler()
-    benchmark_linear()
+    benchmark_layernorm(args.min_run_time)
+    benchmark_activation(args.min_run_time)
+    benchmark_rotary(args.min_run_time)
+    benchmark_kvcache(args.min_run_time)
+    if not args.skip_sampler:
+        benchmark_sampler(args.min_run_time)
+    benchmark_linear(args.min_run_time)
+    summary = print_summary()
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(summary + "\n", encoding="utf-8")
+        print(f"\nSaved Markdown summary to {output_path}")
 
     dist.destroy_process_group()
     print("\nAll benchmarks complete!")

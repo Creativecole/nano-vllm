@@ -117,10 +117,14 @@ Useful commands:
 ```bash
 pytest tests/test_kernels.py
 NANOVLLM_TEST_MODEL=/path/to/Qwen3-0.6B pytest tests/test_fp8_integration.py
+python bench_kernels.py --min-run-time 1.0 --skip-sampler
 python bench_fp8_kvcache.py --model /path/to/Qwen3-0.6B --max-model-len 4096
 python bench_fp8_gemm.py
 python experiments/tma_kvcache_spike.py
 ```
+
+`bench_kernels.py` compares the Triton kernels against their original torch.compile / eager baselines
+and prints a Markdown summary table with median latency, speedup, and correctness status.
 
 For resume reporting, capture the BF16 vs FP8 KV block count, generated tokens/s, peak memory, and
 inter-token latency slope across context lengths. The expected headline is that FP8 halves KV-cache
