@@ -1,6 +1,18 @@
 import os
 from dataclasses import dataclass
+import torch
 from transformers import AutoConfig
+
+
+_DTYPE_MAP = {
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "half": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+}
 
 
 def infer_max_position_embeddings(hf_config, default: int) -> int:
@@ -23,6 +35,19 @@ def infer_max_position_embeddings(hf_config, default: int) -> int:
             if isinstance(value, int) and value > 0:
                 return value
 
+    return default
+
+
+def infer_torch_dtype(hf_config, default: torch.dtype = torch.bfloat16) -> torch.dtype:
+    for attr in ("dtype", "torch_dtype"):
+        value = getattr(hf_config, attr, None)
+        if isinstance(value, torch.dtype) and value.is_floating_point:
+            return value
+        if isinstance(value, str):
+            key = value.removeprefix("torch.").lower()
+            dtype = _DTYPE_MAP.get(key)
+            if dtype is not None:
+                return dtype
     return default
 
 
@@ -52,4 +77,7 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         max_position_embeddings = infer_max_position_embeddings(self.hf_config, self.max_model_len)
         self.hf_config.max_position_embeddings = max_position_embeddings
+        dtype = infer_torch_dtype(self.hf_config)
+        self.hf_config.dtype = dtype
+        self.hf_config.torch_dtype = dtype
         self.max_model_len = min(self.max_model_len, max_position_embeddings)
