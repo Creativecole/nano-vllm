@@ -87,7 +87,10 @@ def triton_gemv(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
     return out
 
 
-GEMV_THRESHOLD = 16
+# RTX 5090 benchmark showed this educational Triton GEMV is slower than
+# cuBLAS for Qwen3 decode shapes, so keep it available for experiments but
+# do not route production forwards through it by default.
+GEMV_THRESHOLD = 0
 
 
 class LinearBase(nn.Module):

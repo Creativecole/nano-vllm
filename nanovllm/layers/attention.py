@@ -38,6 +38,30 @@ def flash_attn_supports_fp8_kvcache() -> bool:
 @triton.jit
 def store_kvcache_kernel(
     key_ptr,
+    key_stride,
+    value_ptr,
+    value_stride,
+    k_cache_ptr,
+    v_cache_ptr,
+    slot_mapping_ptr,
+    D: tl.constexpr,
+):
+    """1D grid: each program stores one token's full BF16 K/V vector."""
+    idx = tl.program_id(0)
+    slot = tl.load(slot_mapping_ptr + idx)
+    if slot == -1:
+        return
+    offsets = tl.arange(0, D)
+    key = tl.load(key_ptr + idx * key_stride + offsets)
+    value = tl.load(value_ptr + idx * value_stride + offsets)
+    cache_offsets = slot * D + offsets
+    tl.store(k_cache_ptr + cache_offsets, key)
+    tl.store(v_cache_ptr + cache_offsets, value)
+
+
+@triton.jit
+def store_kvcache_2d_kernel(
+    key_ptr,
     value_ptr,
     k_cache_ptr,
     v_cache_ptr,
@@ -124,9 +148,20 @@ def store_kvcache_fp8_kernel(
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
     """Standard BF16 KV cache store (non-FP8 path)."""
     N, num_kv_heads, head_dim = key.shape
+    D = num_kv_heads * head_dim
+    assert key.stride(-1) == 1 and value.stride(-1) == 1
+    assert key.stride(1) == head_dim and value.stride(1) == head_dim
+    assert k_cache.stride(1) == D and v_cache.stride(1) == D
+    assert slot_mapping.numel() == N
+    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
+
+
+def store_kvcache_2d(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
+    """Experimental 2D BF16 KV cache store used by microbenchmarks."""
+    N, num_kv_heads, head_dim = key.shape
     BLOCK_HD = _next_power_of_2(head_dim)
     assert key.stride(-1) == 1 and value.stride(-1) == 1
-    store_kvcache_kernel[(N, num_kv_heads)](
+    store_kvcache_2d_kernel[(N, num_kv_heads)](
         key, value, k_cache, v_cache, slot_mapping,
         key.stride(0), key.stride(1),
         k_cache.stride(1), k_cache.stride(2),

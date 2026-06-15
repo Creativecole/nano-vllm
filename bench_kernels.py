@@ -288,8 +288,8 @@ def benchmark_kvcache(min_run_time):
         D = num_kv_heads * head_dim
         store_kvcache_kernel_old[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
-    # --- New 2D kernel ---
-    from nanovllm.layers.attention import store_kvcache as store_kvcache_new
+    # --- Experimental 2D kernel ---
+    from nanovllm.layers.attention import store_kvcache_2d as store_kvcache_new
 
     results = []
     for N in [1, 16, 128, 512, 2048]:
