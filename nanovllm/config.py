@@ -15,6 +15,63 @@ _DTYPE_MAP = {
 }
 
 
+_MODEL_ATTRS = (
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "intermediate_size",
+    "hidden_act",
+    "rms_norm_eps",
+    "attention_bias",
+    "head_dim",
+    "rope_theta",
+    "rope_scaling",
+    "tie_word_embeddings",
+    "max_position_embeddings",
+    "max_sequence_length",
+    "max_seq_len",
+    "seq_length",
+    "n_positions",
+    "model_max_length",
+)
+
+
+def iter_config_candidates(hf_config):
+    yield hf_config
+    for attr in ("text_config", "llm_config", "language_config", "decoder_config", "model_config"):
+        value = getattr(hf_config, attr, None)
+        if value is not None and value is not hf_config:
+            yield value
+
+
+def get_first_config_attr(hf_config, attr: str, default=None):
+    for config in iter_config_candidates(hf_config):
+        value = getattr(config, attr, None)
+        if value is not None:
+            return value
+    return default
+
+
+def normalize_text_config_attrs(hf_config):
+    for attr in _MODEL_ATTRS:
+        if getattr(hf_config, attr, None) is None:
+            value = get_first_config_attr(hf_config, attr)
+            if value is not None:
+                setattr(hf_config, attr, value)
+
+    if getattr(hf_config, "tie_word_embeddings", None) is None:
+        hf_config.tie_word_embeddings = False
+
+    missing = [attr for attr in _MODEL_ATTRS[:8] if getattr(hf_config, attr, None) is None]
+    if missing:
+        raise AttributeError(
+            f"Model config is missing required text-model attributes: {missing}. "
+            "If this is a non-dense or wrapped architecture, add an explicit model adapter."
+        )
+
+
 def infer_max_position_embeddings(hf_config, default: int) -> int:
     for attr in (
         "max_position_embeddings",
@@ -28,7 +85,7 @@ def infer_max_position_embeddings(hf_config, default: int) -> int:
         if isinstance(value, int) and value > 0:
             return value
 
-    rope_scaling = getattr(hf_config, "rope_scaling", None)
+    rope_scaling = get_first_config_attr(hf_config, "rope_scaling")
     if isinstance(rope_scaling, dict):
         for key in ("max_position_embeddings", "original_max_position_embeddings"):
             value = rope_scaling.get(key)
@@ -40,7 +97,7 @@ def infer_max_position_embeddings(hf_config, default: int) -> int:
 
 def infer_torch_dtype(hf_config, default: torch.dtype = torch.bfloat16) -> torch.dtype:
     for attr in ("dtype", "torch_dtype"):
-        value = getattr(hf_config, attr, None)
+        value = get_first_config_attr(hf_config, attr)
         if isinstance(value, torch.dtype) and value.is_floating_point:
             return value
         if isinstance(value, str):
@@ -75,6 +132,7 @@ class Config:
         assert self.kv_cache_dtype in {"auto", "bf16", "fp8_e4m3"}
         assert self.kv_cache_scale > 0
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        normalize_text_config_attrs(self.hf_config)
         max_position_embeddings = infer_max_position_embeddings(self.hf_config, self.max_model_len)
         self.hf_config.max_position_embeddings = max_position_embeddings
         dtype = infer_torch_dtype(self.hf_config)
