@@ -103,17 +103,29 @@ Measured on RTX 5090 with `python bench_kernels.py --min-run-time 1.0 --skip-sam
 | KV-cache store 2D grid | 1D Triton store | ~0.84-0.86x | Experimental only |
 | Linear GEMV | `torch.nn.functional.linear` / cuBLAS | ~0.27-0.36x | Disabled by default |
 
+The repo also includes a standalone CUDA C++ GEMM worklog benchmark inspired by
+[CUDA matmul optimization](https://siboehm.com/articles/22/CUDA-MMM) and
+[RTX 5090 CUDA kernel engineering](https://gau-nernst.github.io/fa-5090/). It starts with a naive
+FP32 GEMM kernel and a shared-memory tiled GEMM kernel, then compares both against `torch.matmul` /
+cuBLAS on Qwen3-like linear-layer shapes. This is kept separate from `LinearBase` because cuBLAS
+remains the production baseline until a custom BF16 Tensor Core kernel proves faster.
+
 Useful commands:
 
 ```bash
 pytest tests/test_kernels.py
 python bench_kernels.py --min-run-time 1.0 --skip-sampler --output kernels_5090_qwen3_0.6b.md
+python bench_cuda_gemm.py --min-run-time 1.0 --output cuda_gemm_5090.md
 python bench_fp8_kvcache.py --model /path/to/Qwen3-0.6B --max-model-len 4096
 ```
 
 `bench_kernels.py` prints a Markdown summary table with median latency, speedup, and correctness status.
 The benchmark is meant to document both successful kernel substitutions and negative results, which keeps
 the default inference path conservative.
+
+`bench_cuda_gemm.py` JIT-compiles the CUDA extension in `csrc/cuda_gemm_kernel.cu` and reports latency,
+GFLOP/s, speedup versus cuBLAS, and correctness for each GEMM shape. The next optimization steps are BF16
+Tensor Core MMA, warp tiling, vectorized global-memory loads, and double-buffered shared-memory staging.
 
 ## Experimental FP8 KV Cache
 
