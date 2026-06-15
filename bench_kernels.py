@@ -296,7 +296,10 @@ def benchmark_kvcache(min_run_time):
         v_cache = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16)
         k_cache_ref = torch.zeros_like(k_cache)
         v_cache_ref = torch.zeros_like(v_cache)
-        slot_mapping = torch.randint(0, num_blocks * block_size, (N,), device=device, dtype=torch.int32)
+        # Use unique slots for deterministic correctness checks. Duplicate slots
+        # create write races where old 1D and new 2D kernels may legitimately
+        # leave different "last writer" values in the same cache location.
+        slot_mapping = torch.randperm(num_blocks * block_size, device=device, dtype=torch.int32)[:N]
 
         store_kvcache_old(key, value, k_cache_ref, v_cache_ref, slot_mapping)
         store_kvcache_new(key, value, k_cache, v_cache, slot_mapping)
