@@ -8,7 +8,6 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.layers.attention import flash_attn_supports_fp8_kvcache
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -47,30 +46,6 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
-
-    def resolve_kv_cache_dtype(self) -> torch.dtype:
-        requested = self.config.kv_cache_dtype
-        fp8_dtype = getattr(torch, "float8_e4m3fn", None)
-        if requested == "bf16":
-            self.config.resolved_kv_cache_dtype = "bf16"
-            return self.config.hf_config.dtype
-        if requested == "fp8_e4m3":
-            if fp8_dtype is None:
-                raise RuntimeError("torch.float8_e4m3fn is required for kv_cache_dtype='fp8_e4m3'")
-            if not flash_attn_supports_fp8_kvcache():
-                raise RuntimeError(
-                    "kv_cache_dtype='fp8_e4m3' requires a FlashAttention build whose "
-                    "flash_attn_with_kvcache exposes k_descale/v_descale."
-                )
-            self.config.resolved_kv_cache_dtype = "fp8_e4m3"
-            return fp8_dtype
-
-        major, _ = torch.cuda.get_device_capability()
-        if fp8_dtype is not None and major >= 10 and flash_attn_supports_fp8_kvcache():
-            self.config.resolved_kv_cache_dtype = "fp8_e4m3"
-            return fp8_dtype
-        self.config.resolved_kv_cache_dtype = "bf16"
-        return self.config.hf_config.dtype
 
     def exit(self):
         if self.world_size > 1:
@@ -128,14 +103,14 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        kv_cache_dtype = self.resolve_kv_cache_dtype()
+        kv_dtype = hf_config.dtype
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        kv_itemsize = torch.empty((), dtype=kv_cache_dtype).element_size()
+        kv_itemsize = torch.empty((), dtype=kv_dtype).element_size()
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * kv_itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
@@ -146,24 +121,14 @@ class ModelRunner:
             self.block_size,
             num_kv_heads,
             head_dim,
-            dtype=kv_cache_dtype,
+            dtype=kv_dtype,
         )
-        fp8_kv = config.resolved_kv_cache_dtype == "fp8_e4m3"
-        self.k_scale = self.v_scale = None
-        if fp8_kv:
-            scale_shape = (hf_config.num_hidden_layers, num_kv_heads)
-            self.k_scale = torch.full(scale_shape, config.kv_cache_scale, dtype=torch.float32)
-            self.v_scale = torch.full(scale_shape, config.kv_cache_scale, dtype=torch.float32)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 module.layer_id = layer_id
-                module.cache_dtype = config.resolved_kv_cache_dtype
-                module.fp8_kv = fp8_kv
-                module.k_scale = self.k_scale
-                module.v_scale = self.v_scale
                 layer_id += 1
         assert layer_id == hf_config.num_hidden_layers
 

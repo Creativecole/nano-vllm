@@ -33,9 +33,9 @@ Or install directly from this fork:
 pip install git+https://github.com/Creativecole/nano-vllm.git
 ```
 
-This fork keeps the default serving path on FlashAttention 2 and BF16 KV cache for reproducible results.
-Experimental FP8 KV-cache code is kept behind `kv_cache_dtype="fp8_e4m3"` and requires a FlashAttention
-build whose `flash_attn_with_kvcache` exposes `k_descale` / `v_descale`.
+This fork keeps the serving path on FlashAttention 2, model-dtype KV cache, and cuBLAS Linear for
+reproducible results. Experimental kernels are developed behind benchmarks before they are considered
+for the default inference path.
 
 ## Model Download
 
@@ -60,7 +60,6 @@ llm = LLM(
     "/YOUR/MODEL/PATH",
     enforce_eager=True,
     tensor_parallel_size=1,
-    kv_cache_dtype="bf16",
 )
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
 prompts = ["Hello, Nano-vLLM."]
@@ -116,7 +115,6 @@ Useful commands:
 pytest tests/test_kernels.py
 python bench_kernels.py --min-run-time 1.0 --skip-sampler --output kernels_5090_qwen3_0.6b.md
 python bench_cuda_gemm.py --min-run-time 1.0 --output cuda_gemm_5090.md
-python bench_fp8_kvcache.py --model /path/to/Qwen3-0.6B --max-model-len 4096
 ```
 
 `bench_kernels.py` prints a Markdown summary table with median latency, speedup, and correctness status.
@@ -127,15 +125,8 @@ the default inference path conservative.
 GFLOP/s, speedup versus cuBLAS, and correctness for each GEMM shape. The next optimization steps are BF16
 Tensor Core MMA, warp tiling, vectorized global-memory loads, and double-buffered shared-memory staging.
 
-## Experimental FP8 KV Cache
-
-FP8 KV cache remains an explicit research path instead of a default feature. To use it, pass
-`kv_cache_dtype="fp8_e4m3"` and run on a PyTorch / FlashAttention stack where the decode kernel exposes
-`k_descale` and `v_descale`. If that interface is missing, nano-vLLM raises a clear error instead of
-silently running an incorrect FP8 path.
-
-Future work includes validating FP8 KV cache on a compatible FlashAttention 3 build, FP8 GEMM
-microbenchmarks, and TMA experiments for paged KV-cache memory movement.
+Future work includes model-shape-aware kernel autotuning, BF16 Tensor Core GEMM experiments, and
+additional scheduler / KV-cache observability for Qwen3-4B workloads.
 
 
 ## Star History

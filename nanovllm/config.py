@@ -117,9 +117,6 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
-    kv_cache_dtype: str = "bf16"
-    kv_cache_scale: float = 1.0
-    resolved_kv_cache_dtype: str = "bf16"
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -129,8 +126,6 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
-        assert self.kv_cache_dtype in {"auto", "bf16", "fp8_e4m3"}
-        assert self.kv_cache_scale > 0
         self.hf_config = AutoConfig.from_pretrained(self.model)
         normalize_text_config_attrs(self.hf_config)
         max_position_embeddings = infer_max_position_embeddings(self.hf_config, self.max_model_len)

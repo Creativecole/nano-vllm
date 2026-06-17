@@ -34,33 +34,6 @@ def test_store_kvcache_matches_reference():
     torch.testing.assert_close(v_cache.view_as(v_ref), v_ref)
 
 
-@pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"), reason="torch.float8_e4m3fn is unavailable")
-def test_store_kvcache_fp8_quantizes_with_scale():
-    from nanovllm.layers.attention import FP8_E4M3_MAX, store_kvcache_fp8
-
-    n_tokens, num_heads, head_dim = 3, 2, 8
-    key = torch.randn(n_tokens, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
-    value = torch.randn_like(key)
-    k_cache = torch.empty(4, 16, num_heads, head_dim, device="cuda", dtype=torch.float8_e4m3fn)
-    v_cache = torch.empty_like(k_cache)
-    k_scale = torch.full((2, num_heads), 0.5, device="cuda", dtype=torch.float32)
-    v_scale = torch.full((2, num_heads), 0.25, device="cuda", dtype=torch.float32)
-    slot_mapping = torch.tensor([2, -1, 9], device="cuda", dtype=torch.int32)
-
-    store_kvcache_fp8(key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping, layer_id=1)
-    torch.cuda.synchronize()
-
-    flat_k = k_cache.view(-1, num_heads, head_dim)
-    flat_v = v_cache.view(-1, num_heads, head_dim)
-    for token_id, slot in enumerate(slot_mapping.cpu().tolist()):
-        if slot < 0:
-            continue
-        k_expected = torch.clamp(key[token_id].float() / 0.5, -FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-        v_expected = torch.clamp(value[token_id].float() / 0.25, -FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-        torch.testing.assert_close(flat_k[slot].float(), k_expected.float(), rtol=0, atol=0)
-        torch.testing.assert_close(flat_v[slot].float(), v_expected.float(), rtol=0, atol=0)
-
-
 def test_silu_and_mul_matches_torch():
     from nanovllm.layers.activation import SiluAndMul
 
