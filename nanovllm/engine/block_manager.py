@@ -31,6 +31,12 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.max_used_blocks = 0
+        self.prefix_cache_hits = 0
+        self.prefix_cache_misses = 0
+
+    def _update_peak_usage(self):
+        self.max_used_blocks = max(self.max_used_blocks, len(self.used_block_ids))
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -48,6 +54,7 @@ class BlockManager:
             del self.hash_to_block_id[block.hash]
         block.reset()
         self.used_block_ids.add(block_id)
+        self._update_peak_usage()
         return block_id
 
     def _deallocate_block(self, block_id: int):
@@ -64,7 +71,9 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                self.prefix_cache_misses += 1
                 break
+            self.prefix_cache_hits += 1
             num_cached_blocks += 1
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
@@ -86,6 +95,7 @@ class BlockManager:
                 block.ref_count = 1
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
+                self._update_peak_usage()
             seq.block_table.append(block_id)
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
@@ -118,3 +128,21 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+
+    def metrics(self):
+        total_blocks = len(self.blocks)
+        used_blocks = len(self.used_block_ids)
+        free_blocks = len(self.free_block_ids)
+        prefix_total = self.prefix_cache_hits + self.prefix_cache_misses
+        hit_rate = self.prefix_cache_hits / prefix_total if prefix_total else 0.0
+        return {
+            "num_kvcache_blocks": total_blocks,
+            "used_blocks": used_blocks,
+            "free_blocks": free_blocks,
+            "block_utilization": used_blocks / total_blocks if total_blocks else 0.0,
+            "max_used_blocks": self.max_used_blocks,
+            "max_block_utilization": self.max_used_blocks / total_blocks if total_blocks else 0.0,
+            "prefix_cache_hits": self.prefix_cache_hits,
+            "prefix_cache_misses": self.prefix_cache_misses,
+            "prefix_cache_hit_rate": hit_rate,
+        }

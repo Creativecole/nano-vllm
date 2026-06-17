@@ -61,6 +61,20 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
+    def metrics(self):
+        config = self.model_runner.config
+        metrics = self.scheduler.metrics()
+        metrics.update({
+            "max_model_len": config.max_model_len,
+            "kvcache_block_size": config.kvcache_block_size,
+            "kv_cache_dtype": str(config.hf_config.dtype).removeprefix("torch."),
+            "norm_backend": config.norm_backend,
+            "activation_backend": config.activation_backend,
+            "rope_backend": config.rope_backend,
+            "linear_backend": config.linear_backend,
+        })
+        return metrics
+
     def generate(
         self,
         prompts: list[str] | list[list[int]],

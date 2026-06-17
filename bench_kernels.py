@@ -22,6 +22,8 @@ os.environ["MASTER_ADDR"] = "localhost"
 os.environ["MASTER_PORT"] = "29500"
 import torch.distributed as dist
 
+from nanovllm.utils.model_shapes import ModelShapes
+
 # Initialize a single-GPU process group for the linear layers
 dist.init_process_group("gloo", rank=0, world_size=1)
 
@@ -64,13 +66,13 @@ def assert_close(name, actual, expected, rtol=2e-2, atol=2e-2):
     return f"pass max={diff.max().item():.3g}, mean={diff.mean().item():.3g}"
 
 
-def benchmark_layernorm(min_run_time):
+def benchmark_layernorm(min_run_time, shapes: ModelShapes):
     """Benchmark RMSNorm: original torch.compile vs Triton kernel."""
     print("\n" + "=" * 70)
     print("BENCHMARK 1: RMSNorm (layernorm.py)")
     print("=" * 70)
 
-    hidden_size = 1024  # Qwen3-0.6B hidden_size
+    hidden_size = shapes.hidden_size
     eps = 1e-6
     device = "cuda"
 
@@ -141,14 +143,14 @@ def benchmark_layernorm(min_run_time):
     compare.print()
 
 
-def benchmark_activation(min_run_time):
+def benchmark_activation(min_run_time, shapes: ModelShapes):
     """Benchmark SiluAndMul: original torch.compile vs Triton kernel."""
     print("\n" + "=" * 70)
     print("BENCHMARK 2: SiluAndMul (activation.py)")
     print("=" * 70)
 
     device = "cuda"
-    intermediate_size = 2816  # Qwen3-0.6B intermediate_size (NOT power of 2!)
+    intermediate_size = shapes.intermediate_size
 
     # --- Original ---
     class SiluAndMulOriginal(torch.nn.Module):
@@ -182,17 +184,17 @@ def benchmark_activation(min_run_time):
     compare.print()
 
 
-def benchmark_rotary(min_run_time):
+def benchmark_rotary(min_run_time, shapes: ModelShapes):
     """Benchmark RotaryEmbedding: original torch.compile vs Triton kernel."""
     print("\n" + "=" * 70)
     print("BENCHMARK 3: RotaryEmbedding (rotary_embedding.py)")
     print("=" * 70)
 
     device = "cuda"
-    head_dim = 128
-    num_heads = 16
-    num_kv_heads = 8
-    max_pos = 4096
+    head_dim = shapes.head_dim
+    num_heads = shapes.num_attention_heads
+    num_kv_heads = shapes.num_key_value_heads
+    max_pos = shapes.max_position_embeddings
 
     # --- Original ---
     def apply_rotary_emb_orig(x, cos, sin):
@@ -250,7 +252,7 @@ def benchmark_rotary(min_run_time):
     compare.print()
 
 
-def benchmark_kvcache(min_run_time):
+def benchmark_kvcache(min_run_time, shapes: ModelShapes):
     """Benchmark store_kvcache: original 1D grid vs new 2D grid."""
     print("\n" + "=" * 70)
     print("BENCHMARK 4: store_kvcache (attention.py)")
@@ -259,8 +261,8 @@ def benchmark_kvcache(min_run_time):
     import triton
     import triton.language as tl
     device = "cuda"
-    num_kv_heads = 8
-    head_dim = 128
+    num_kv_heads = shapes.num_key_value_heads
+    head_dim = shapes.head_dim
     num_blocks = 256
     block_size = 256
     D = num_kv_heads * head_dim
@@ -324,7 +326,7 @@ def benchmark_kvcache(min_run_time):
     compare.print()
 
 
-def benchmark_sampler(min_run_time):
+def benchmark_sampler(min_run_time, shapes: ModelShapes):
     """Benchmark Sampler: original full-softmax vs top-k fused."""
     print("\n" + "=" * 70)
     print("BENCHMARK 5: Sampler (sampler.py)")
@@ -345,7 +347,10 @@ def benchmark_sampler(min_run_time):
     from nanovllm.layers.sampler import Sampler
 
     results = []
-    for V in [32000, 151936]:  # LLaMA vocab, Qwen3 vocab
+    vocab_sizes = [shapes.vocab_size]
+    if shapes.vocab_size != 32000:
+        vocab_sizes.insert(0, 32000)
+    for V in vocab_sizes:
         for N in [1, 16, 64, 256]:
             logits = torch.randn(N, V, device=device, dtype=torch.bfloat16)
             temps = torch.ones(N, device=device, dtype=torch.float32)
@@ -376,7 +381,7 @@ def benchmark_sampler(min_run_time):
     compare.print()
 
 
-def benchmark_linear(min_run_time):
+def benchmark_linear(min_run_time, shapes: ModelShapes):
     """Benchmark Linear: F.linear vs Triton GEMV for small batches."""
     print("\n" + "=" * 70)
     print("BENCHMARK 6: Linear GEMV (linear.py)")
@@ -386,12 +391,11 @@ def benchmark_linear(min_run_time):
     from nanovllm.layers.linear import triton_gemv
 
     results = []
-    # typical Qwen3-0.6B layer dims
     configs = [
-        ("QKV", 1024, 1280),       # hidden -> (q+k+v) heads
-        ("Gate/Up", 1024, 5632),    # hidden -> intermediate*2
-        ("Down", 2816, 1024),       # intermediate -> hidden
-        ("O_proj", 1024, 1024),     # hidden -> hidden
+        ("QKV", shapes.hidden_size, shapes.qkv_dim),
+        ("O_proj", shapes.o_proj_in, shapes.hidden_size),
+        ("Gate/Up", shapes.hidden_size, shapes.intermediate_size * 2),
+        ("Down", shapes.intermediate_size, shapes.hidden_size),
     ]
     for name, K, N in configs:
         weight = torch.randn(N, K, device=device, dtype=torch.bfloat16)
@@ -439,8 +443,15 @@ def print_summary():
     return text
 
 
+def load_shapes(model_path: str | None) -> ModelShapes:
+    if model_path:
+        return ModelShapes.from_model(model_path)
+    return ModelShapes.default()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark Triton kernels against original torch.compile/eager baselines.")
+    parser.add_argument("--model", type=str, default=None, help="Optional model path used to derive Qwen layer shapes.")
     parser.add_argument("--min-run-time", type=float, default=2.0)
     parser.add_argument("--skip-sampler", action="store_true", help="Skip the expensive full-vocab sampler benchmark.")
     parser.add_argument("--output", type=str, default=None, help="Optional path to save the final Markdown summary table.")
@@ -457,14 +468,16 @@ if __name__ == "__main__":
     print(f"GPU: {torch.cuda.get_device_name()}")
     print(f"PyTorch: {torch.__version__}")
     print(f"CUDA: {torch.version.cuda}")
+    shapes = load_shapes(args.model)
+    print(f"Shapes: {shapes.model_name} ({shapes.describe()})")
 
-    benchmark_layernorm(args.min_run_time)
-    benchmark_activation(args.min_run_time)
-    benchmark_rotary(args.min_run_time)
-    benchmark_kvcache(args.min_run_time)
+    benchmark_layernorm(args.min_run_time, shapes)
+    benchmark_activation(args.min_run_time, shapes)
+    benchmark_rotary(args.min_run_time, shapes)
+    benchmark_kvcache(args.min_run_time, shapes)
     if not args.skip_sampler:
-        benchmark_sampler(args.min_run_time)
-    benchmark_linear(args.min_run_time)
+        benchmark_sampler(args.min_run_time, shapes)
+    benchmark_linear(args.min_run_time, shapes)
     summary = print_summary()
     if args.output:
         output_path = Path(args.output)

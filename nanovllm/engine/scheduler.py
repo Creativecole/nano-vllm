@@ -19,6 +19,16 @@ class Scheduler:
     def is_finished(self):
         return not self.waiting and not self.running
 
+    def metrics(self):
+        metrics = self.block_manager.metrics()
+        metrics.update({
+            "max_num_seqs": self.max_num_seqs,
+            "max_num_batched_tokens": self.max_num_batched_tokens,
+            "waiting_seqs": len(self.waiting),
+            "running_seqs": len(self.running),
+        })
+        return metrics
+
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 

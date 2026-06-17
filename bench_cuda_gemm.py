@@ -13,6 +13,8 @@ import torch
 import torch.utils.benchmark as benchmark
 from torch.utils.cpp_extension import load
 
+from nanovllm.utils.model_shapes import ModelShapes
+
 
 SUMMARY = []
 
@@ -81,8 +83,15 @@ def print_summary():
     return text
 
 
+def load_shapes(model_path: str | None) -> ModelShapes:
+    if model_path:
+        return ModelShapes.from_model(model_path)
+    return ModelShapes.default()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark CUDA C++ GEMM kernels against torch.matmul/cuBLAS.")
+    parser.add_argument("--model", type=str, default=None, help="Optional model path used to derive Qwen linear shapes.")
     parser.add_argument("--min-run-time", type=float, default=1.0)
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
@@ -100,15 +109,21 @@ def main():
     print(f"GPU: {torch.cuda.get_device_name()}")
     print(f"PyTorch: {torch.__version__}")
     print(f"CUDA: {torch.version.cuda}")
+    shapes = load_shapes(args.model)
+    print(f"Shapes: {shapes.model_name} ({shapes.describe()})")
 
     configs = [
-        ("decode_qkv", 1, 1024, 1280),
-        ("decode_mlp", 1, 1024, 5632),
-        ("small_batch_qkv", 16, 1024, 1280),
-        ("small_batch_mlp", 16, 1024, 5632),
-        ("prefill_qkv", 256, 1024, 1280),
-        ("prefill_mlp", 256, 1024, 5632),
-        ("square_1024", 1024, 1024, 1024),
+        ("qkv_decode", 1, shapes.hidden_size, shapes.qkv_dim),
+        ("o_proj_decode", 1, shapes.o_proj_in, shapes.hidden_size),
+        ("gate_up_decode", 1, shapes.hidden_size, shapes.intermediate_size * 2),
+        ("down_proj_decode", 1, shapes.intermediate_size, shapes.hidden_size),
+        ("qkv_small_batch", 16, shapes.hidden_size, shapes.qkv_dim),
+        ("o_proj_small_batch", 16, shapes.o_proj_in, shapes.hidden_size),
+        ("gate_up_small_batch", 16, shapes.hidden_size, shapes.intermediate_size * 2),
+        ("down_proj_small_batch", 16, shapes.intermediate_size, shapes.hidden_size),
+        ("qkv_prefill", 256, shapes.hidden_size, shapes.qkv_dim),
+        ("gate_up_prefill", 256, shapes.hidden_size, shapes.intermediate_size * 2),
+        ("down_proj_prefill", 256, shapes.intermediate_size, shapes.hidden_size),
     ]
 
     results = []
