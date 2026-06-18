@@ -126,6 +126,8 @@ python bench_kernels.py --model /path/to/Qwen3-4B --min-run-time 1.0 --skip-samp
 python bench_cuda_gemm.py --min-run-time 1.0 --output cuda_gemm_5090.md
 python bench_cuda_gemm.py --model /path/to/Qwen3-4B --min-run-time 1.0 --output cuda_gemm_qwen3_4b_5090.md
 python bench_e2e.py --model /path/to/Qwen3-4B --prompt-len 512 --num-prompts 4 --max-tokens 128 --enforce-eager --output e2e_qwen3_4b_5090.md
+python profile_e2e.py --model /path/to/Qwen3-4B --prompt-len 512 --num-prompts 4 --max-tokens 128 --enforce-eager --profile-steps 64 --profile-memory --record-shapes --trace-output profile_qwen3_4b_5090.json --summary-output profile_qwen3_4b_5090.md
+python compare_upstream.py --upstream-repo /path/to/upstream/nano-vllm --model /path/to/Qwen3-4B --prompt-len 512 --num-prompts 4 --max-tokens 128 --enforce-eager --repeat 3 --warmup 1 --output upstream_vs_fork_qwen3_4b_5090.md
 python analyze_kernel_results.py --kernel-results kernels_qwen3_4b_5090.md --cuda-gemm-results cuda_gemm_qwen3_4b_5090.md --e2e-results e2e_qwen3_4b_5090.md --output KERNEL_POLICY_REPORT.md --policy-output kernel_policy_5090.json
 ```
 
@@ -141,6 +143,13 @@ loads, register tiling, BF16 Tensor Core MMA, and comparison with Triton `tl.dot
 `bench_e2e.py` runs real nano-vLLM generation through the scheduler loop and reports elapsed time, TTFT,
 prefill/decode time, decode tokens/s, ITL, peak GPU memory, KV-cache block counts, block utilization,
 prefix-cache hit/miss counters, and the active backend configuration.
+
+`profile_e2e.py` runs the same scheduler-loop workload under PyTorch profiler, exports a Chrome trace,
+and writes a top-ops summary sorted by CUDA time. This is intended to show where time is spent rather
+than only reporting aggregate throughput.
+
+`compare_upstream.py` runs an upstream nano-vLLM checkout and this fork in isolated Python subprocesses
+with the same Qwen3-4B prompt/decode configuration, then writes an upstream-vs-fork Markdown comparison.
 
 `analyze_kernel_results.py` turns the three benchmark result files into a Markdown report and
 `kernel_policy_5090.json`. The generated policy is an analysis artifact only; it is not wired into

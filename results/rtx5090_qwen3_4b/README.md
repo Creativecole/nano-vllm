@@ -23,6 +23,9 @@ serving metrics, and the derived kernel policy without changing the conservative
 | `e2e_qwen3_4b_5090_repeat3.md` | Repeat-run end-to-end results with mean/p50/p95 |
 | `KERNEL_POLICY_REPORT.md` | Generated benchmark analysis report |
 | `kernel_policy_5090.json` | Generated kernel policy artifact |
+| `profile_qwen3_4b_5090.md` | Optional PyTorch profiler top-ops summary |
+| `profile_qwen3_4b_5090.json` | Optional Chrome trace exported by PyTorch profiler |
+| `upstream_vs_fork_qwen3_4b_5090.md` | Optional upstream nano-vLLM vs fork e2e comparison |
 
 ## Headline Findings
 
@@ -59,6 +62,29 @@ python bench_e2e.py \
   --repeat 3 \
   --output results/rtx5090_qwen3_4b/e2e_qwen3_4b_5090_repeat3.md
 
+python profile_e2e.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-tokens 128 \
+  --enforce-eager \
+  --profile-steps 64 \
+  --profile-memory \
+  --record-shapes \
+  --trace-output results/rtx5090_qwen3_4b/profile_qwen3_4b_5090.json \
+  --summary-output results/rtx5090_qwen3_4b/profile_qwen3_4b_5090.md
+
+python compare_upstream.py \
+  --upstream-repo ../nano-vllm-upstream \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-tokens 128 \
+  --enforce-eager \
+  --warmup 1 \
+  --repeat 3 \
+  --output results/rtx5090_qwen3_4b/upstream_vs_fork_qwen3_4b_5090.md
+
 python analyze_kernel_results.py \
   --kernel-results results/rtx5090_qwen3_4b/kernels_qwen3_4b_5090.md \
   --cuda-gemm-results results/rtx5090_qwen3_4b/cuda_gemm_qwen3_4b_5090.md \
@@ -84,6 +110,7 @@ The default serving path stays conservative: FlashAttention 2, model-dtype KV ca
 
 ## Next Steps
 
-- Add Nsight Systems / PyTorch profiler evidence for the Qwen3-4B decode path.
+- Inspect the PyTorch profiler trace and summarize the dominant Qwen3-4B decode kernels.
+- Run the upstream-vs-fork comparison on the same RTX 5090 image and archive the generated report.
 - Implement optional backend dispatch only for safe layer kernels such as RMSNorm, activation, and RoPE.
 - Add a BF16 Tensor Core GEMM experiment before considering any Linear runtime integration.
