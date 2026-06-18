@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+from statistics import mean
 from time import perf_counter
 
 import torch
@@ -29,12 +30,37 @@ def markdown_table(row: dict) -> str:
     ])
 
 
+def markdown_rows(rows: list[dict], columns: list[str]) -> str:
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(format_value(row.get(column, "")) for column in columns) + " |")
+    return "\n".join(lines)
+
+
 def percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)
     idx = min(len(ordered) - 1, round((pct / 100.0) * (len(ordered) - 1)))
     return ordered[idx]
+
+
+def aggregate_rows(rows: list[dict], keys: list[str]) -> list[dict]:
+    aggregate = []
+    for key in keys:
+        values = [row[key] for row in rows if isinstance(row.get(key), (int, float))]
+        if not values:
+            continue
+        aggregate.append({
+            "metric": key,
+            "mean": mean(values),
+            "p50": percentile(values, 50),
+            "p95": percentile(values, 95),
+        })
+    return aggregate
 
 
 def run_profiled_generation(llm, prompts: list[list[int]], sampling_params):
@@ -92,22 +118,7 @@ def run_profiled_generation(llm, prompts: list[list[int]], sampling_params):
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description="End-to-end nano-vLLM generation benchmark.")
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--prompt-len", type=int, default=512)
-    parser.add_argument("--num-prompts", type=int, default=4)
-    parser.add_argument("--max-tokens", type=int, default=128)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--enforce-eager", action="store_true")
-    parser.add_argument("--output", type=str, default=None)
-    args = parser.parse_args()
-
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA is required for bench_e2e.py")
-
-    from nanovllm import LLM, SamplingParams
-
+def run_once(args, run_index: int, LLM, SamplingParams):
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     llm = None
@@ -129,7 +140,8 @@ def main():
         peak_mem_gb = torch.cuda.max_memory_allocated() / 1024**3
         metrics = llm.metrics()
         kv_dtype = metrics["kv_cache_dtype"]
-        row = {
+        return {
+            "run": run_index,
             "model": args.model,
             "gpu": torch.cuda.get_device_name(),
             "prompt_len": args.prompt_len,
@@ -169,16 +181,104 @@ def main():
             "rope_backend": metrics["rope_backend"],
             "linear_backend": metrics["linear_backend"],
         }
-        text = markdown_table(row)
-        print(text)
-        if args.output:
-            output_path = Path(args.output)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(text + "\n", encoding="utf-8")
-            print(f"\nSaved Markdown summary to {output_path}")
     finally:
         if llm is not None:
             llm.exit()
+
+
+def format_benchmark_output(rows: list[dict]) -> str:
+    if len(rows) == 1:
+        row = dict(rows[0])
+        row.pop("run", None)
+        return markdown_table(row)
+
+    summary_keys = [
+        "elapsed_s",
+        "ttft_s",
+        "prefill_time_s",
+        "decode_time_s",
+        "decode_tokens_per_s",
+        "itl_ms_avg",
+        "decode_step_ms_p50",
+        "decode_step_ms_p95",
+        "peak_gpu_memory_gb",
+        "max_used_blocks",
+        "max_block_utilization",
+    ]
+    run_columns = [
+        "run",
+        "elapsed_s",
+        "ttft_s",
+        "prefill_time_s",
+        "decode_time_s",
+        "decode_tokens_per_s",
+        "itl_ms_avg",
+        "decode_step_ms_p50",
+        "decode_step_ms_p95",
+        "peak_gpu_memory_gb",
+        "max_used_blocks",
+        "max_block_utilization",
+    ]
+    config_keys = [
+        "model",
+        "gpu",
+        "prompt_len",
+        "num_prompts",
+        "max_tokens",
+        "kv_cache_dtype",
+        "linear_backend",
+        "norm_backend",
+        "activation_backend",
+        "rope_backend",
+    ]
+    config_rows = [{"Metric": key, "Value": rows[0].get(key, "")} for key in config_keys]
+    return "\n\n".join([
+        "## E2E Config",
+        markdown_rows(config_rows, ["Metric", "Value"]),
+        "## Per-Run Results",
+        markdown_rows(rows, run_columns),
+        "## Aggregate Results",
+        markdown_rows(aggregate_rows(rows, summary_keys), ["metric", "mean", "p50", "p95"]),
+    ])
+
+
+def main():
+    parser = argparse.ArgumentParser(description="End-to-end nano-vLLM generation benchmark.")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--prompt-len", type=int, default=512)
+    parser.add_argument("--num-prompts", type=int, default=4)
+    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--warmup", type=int, default=0)
+    parser.add_argument("--output", type=str, default=None)
+    args = parser.parse_args()
+
+    assert args.repeat >= 1
+    assert args.warmup >= 0
+
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is required for bench_e2e.py")
+
+    from nanovllm import LLM, SamplingParams
+
+    for warmup_idx in range(args.warmup):
+        print(f"Warmup {warmup_idx + 1}/{args.warmup}...")
+        run_once(args, warmup_idx + 1, LLM, SamplingParams)
+
+    rows = []
+    for run_idx in range(args.repeat):
+        print(f"Run {run_idx + 1}/{args.repeat}...")
+        rows.append(run_once(args, run_idx + 1, LLM, SamplingParams))
+
+    text = format_benchmark_output(rows)
+    print(text)
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(text + "\n", encoding="utf-8")
+        print(f"\nSaved Markdown summary to {output_path}")
 
 
 if __name__ == "__main__":
