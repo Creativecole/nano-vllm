@@ -112,12 +112,10 @@ Measured on RTX 5090 with `python bench_kernels.py --min-run-time 1.0 --skip-sam
 | KV-cache store 2D grid | 1D Triton store | ~0.84-0.86x | Experimental only |
 | Linear GEMV | `torch.nn.functional.linear` / cuBLAS | ~0.27-0.36x | Disabled by default |
 
-The repo also includes a standalone CUDA C++ GEMM worklog benchmark inspired by
-[CUDA matmul optimization](https://siboehm.com/articles/22/CUDA-MMM) and
-[RTX 5090 CUDA kernel engineering](https://gau-nernst.github.io/fa-5090/). It starts with a naive
-FP32 GEMM kernel and a shared-memory tiled GEMM kernel, then compares both against `torch.matmul` /
-cuBLAS on Qwen3-like linear-layer shapes. This is kept separate from `LinearBase` because cuBLAS
-remains the production baseline until a custom BF16 Tensor Core kernel proves faster.
+The repo also includes a standalone CUDA C++ GEMM worklog benchmark. It starts with a naive FP32 GEMM
+kernel and a shared-memory tiled GEMM kernel, then compares both against `torch.matmul` / cuBLAS on
+Qwen3-like linear-layer shapes. This is kept separate from `LinearBase` because cuBLAS remains the
+production baseline until a custom BF16 Tensor Core kernel proves faster.
 
 Useful commands:
 
