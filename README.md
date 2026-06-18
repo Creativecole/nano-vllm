@@ -139,9 +139,9 @@ GFLOP/s, speedup versus cuBLAS, and correctness for each Qwen linear-layer shape
 worklog, not a production `LinearBase` replacement. The next optimization steps are vectorized global
 loads, register tiling, BF16 Tensor Core MMA, and comparison with Triton `tl.dot` and cuBLAS.
 
-`bench_e2e.py` runs real nano-vLLM generation and reports elapsed time, generated tokens, total/decode
-throughput, peak GPU memory, KV-cache block counts, block utilization, prefix-cache hit/miss counters,
-and the active backend configuration.
+`bench_e2e.py` runs real nano-vLLM generation through the scheduler loop and reports elapsed time, TTFT,
+prefill/decode time, decode tokens/s, ITL, peak GPU memory, KV-cache block counts, block utilization,
+prefix-cache hit/miss counters, and the active backend configuration.
 
 Future work includes model-shape-aware kernel autotuning, BF16 Tensor Core GEMM experiments, and
 additional scheduler / KV-cache observability for Qwen3-4B workloads.

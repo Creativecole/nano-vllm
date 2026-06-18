@@ -29,6 +29,69 @@ def markdown_table(row: dict) -> str:
     ])
 
 
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, round((pct / 100.0) * (len(ordered) - 1)))
+    return ordered[idx]
+
+
+def run_profiled_generation(llm, prompts: list[list[int]], sampling_params):
+    outputs = {}
+    prefill_time_s = 0.0
+    decode_time_s = 0.0
+    prefill_tokens = 0
+    decode_tokens = 0
+    decode_step_latencies = []
+    first_decode_end = None
+
+    for prompt in prompts:
+        llm.add_request(prompt, sampling_params)
+
+    torch.cuda.synchronize()
+    start = perf_counter()
+    while not llm.is_finished():
+        torch.cuda.synchronize()
+        step_start = perf_counter()
+        output, num_tokens = llm.step()
+        torch.cuda.synchronize()
+        step_elapsed = perf_counter() - step_start
+
+        if num_tokens > 0:
+            prefill_time_s += step_elapsed
+            prefill_tokens += num_tokens
+        else:
+            step_decode_tokens = -num_tokens
+            decode_time_s += step_elapsed
+            decode_tokens += step_decode_tokens
+            decode_step_latencies.append(step_elapsed)
+            if first_decode_end is None:
+                first_decode_end = perf_counter()
+
+        for seq_id, token_ids in output:
+            outputs[seq_id] = token_ids
+
+    torch.cuda.synchronize()
+    elapsed = perf_counter() - start
+    ordered_outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+    return {
+        "outputs": ordered_outputs,
+        "elapsed_s": elapsed,
+        "ttft_s": (first_decode_end - start) if first_decode_end is not None else 0.0,
+        "prefill_time_s": prefill_time_s,
+        "decode_time_s": decode_time_s,
+        "prefill_tokens": prefill_tokens,
+        "decode_tokens": decode_tokens,
+        "decode_tokens_per_s": decode_tokens / decode_time_s if decode_time_s else 0.0,
+        "total_tokens_per_s": (prefill_tokens + decode_tokens) / elapsed if elapsed else 0.0,
+        "itl_ms_avg": (decode_time_s / decode_tokens * 1000.0) if decode_tokens else 0.0,
+        "decode_step_ms_p50": percentile(decode_step_latencies, 50) * 1000.0,
+        "decode_step_ms_p95": percentile(decode_step_latencies, 95) * 1000.0,
+        "decode_steps": len(decode_step_latencies),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="End-to-end nano-vLLM generation benchmark.")
     parser.add_argument("--model", required=True)
@@ -59,13 +122,8 @@ def main():
         prompts = [prompt[:] for _ in range(args.num_prompts)]
         sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
 
-        torch.cuda.synchronize()
-        start = perf_counter()
-        outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
-        torch.cuda.synchronize()
-        elapsed = perf_counter() - start
-
-        generated_tokens = sum(len(output["token_ids"]) for output in outputs)
+        result = run_profiled_generation(llm, prompts, sampling_params)
+        generated_tokens = sum(len(token_ids) for token_ids in result["outputs"])
         prompt_tokens = args.prompt_len * args.num_prompts
         total_tokens = prompt_tokens + generated_tokens
         peak_mem_gb = torch.cuda.max_memory_allocated() / 1024**3
@@ -77,11 +135,21 @@ def main():
             "prompt_len": args.prompt_len,
             "num_prompts": args.num_prompts,
             "max_tokens": args.max_tokens,
-            "elapsed_s": elapsed,
+            "elapsed_s": result["elapsed_s"],
+            "ttft_s": result["ttft_s"],
+            "prefill_time_s": result["prefill_time_s"],
+            "decode_time_s": result["decode_time_s"],
+            "decode_steps": result["decode_steps"],
             "prompt_tokens": prompt_tokens,
+            "profiled_prefill_tokens": result["prefill_tokens"],
             "generated_tokens": generated_tokens,
-            "total_tokens_per_s": total_tokens / elapsed,
-            "approx_decode_tokens_per_s": generated_tokens / elapsed,
+            "profiled_decode_tokens": result["decode_tokens"],
+            "total_tokens_per_s": total_tokens / result["elapsed_s"],
+            "profiled_total_tokens_per_s": result["total_tokens_per_s"],
+            "decode_tokens_per_s": result["decode_tokens_per_s"],
+            "itl_ms_avg": result["itl_ms_avg"],
+            "decode_step_ms_p50": result["decode_step_ms_p50"],
+            "decode_step_ms_p95": result["decode_step_ms_p95"],
             "peak_gpu_memory_gb": peak_mem_gb,
             "num_kvcache_blocks": metrics["num_kvcache_blocks"],
             "used_blocks": metrics["used_blocks"],
