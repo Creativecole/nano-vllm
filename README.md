@@ -146,6 +146,8 @@ prefix-cache hit/miss counters, and the active backend configuration.
 `kernel_policy_5090.json`. The generated policy is an analysis artifact only; it is not wired into
 runtime dispatch.
 
+Curated RTX 5090 / Qwen3-4B results are available in `results/rtx5090_qwen3_4b/`.
+
 Future work includes model-shape-aware kernel autotuning, BF16 Tensor Core GEMM experiments, and
 additional scheduler / KV-cache observability for Qwen3-4B workloads.
 

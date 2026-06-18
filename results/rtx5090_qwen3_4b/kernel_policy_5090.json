@@ -1,0 +1,24 @@
+{
+  "device": "NVIDIA GeForce RTX 5090",
+  "model": "Qwen3-4B",
+  "source_files": {
+    "kernel_results": "results/rtx5090_qwen3_4b/kernels_qwen3_4b_5090.md",
+    "cuda_gemm_results": "results/rtx5090_qwen3_4b/cuda_gemm_qwen3_4b_5090.md",
+    "e2e_results": "results/rtx5090_qwen3_4b/e2e_qwen3_4b_5090.md"
+  },
+  "rules": {
+    "RMSNorm": "triton",
+    "AddRMSNorm": "triton",
+    "SiluAndMul": {
+      "N<=128": "triton",
+      "N>=1024": "torch"
+    },
+    "RoPE": {
+      "N<=1024": "triton",
+      "N>=4096": "torch"
+    },
+    "KVCacheStore": "1d_triton",
+    "Linear": "torch_cublas",
+    "CUDA_GEMM": "research_only"
+  }
+}
