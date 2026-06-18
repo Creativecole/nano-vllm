@@ -95,16 +95,26 @@ def infer_max_position_embeddings(hf_config, default: int) -> int:
     return default
 
 
+def coerce_torch_dtype(value) -> torch.dtype | None:
+    if isinstance(value, torch.dtype) and value.is_floating_point:
+        return value
+    if isinstance(value, str):
+        key = value.removeprefix("torch.").lower()
+        return _DTYPE_MAP.get(key)
+    return None
+
+
 def infer_torch_dtype(hf_config, default: torch.dtype = torch.bfloat16) -> torch.dtype:
-    for attr in ("dtype", "torch_dtype"):
-        value = get_first_config_attr(hf_config, attr)
-        if isinstance(value, torch.dtype) and value.is_floating_point:
-            return value
-        if isinstance(value, str):
-            key = value.removeprefix("torch.").lower()
-            dtype = _DTYPE_MAP.get(key)
-            if dtype is not None:
-                return dtype
+    dtype = coerce_torch_dtype(get_first_config_attr(hf_config, "dtype"))
+    if dtype is not None:
+        return dtype
+    for config in iter_config_candidates(hf_config):
+        # Newer Transformers emits a deprecation warning when the torch_dtype
+        # property is accessed. Read the raw config dict for older checkpoints
+        # that still serialize this field.
+        dtype = coerce_torch_dtype(getattr(config, "__dict__", {}).get("torch_dtype"))
+        if dtype is not None:
+            return dtype
     return default
 
 
@@ -140,5 +150,4 @@ class Config:
         self.hf_config.max_position_embeddings = max_position_embeddings
         dtype = infer_torch_dtype(self.hf_config)
         self.hf_config.dtype = dtype
-        self.hf_config.torch_dtype = dtype
         self.max_model_len = min(self.max_model_len, max_position_embeddings)
