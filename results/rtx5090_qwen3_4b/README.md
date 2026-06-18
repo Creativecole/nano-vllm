@@ -23,9 +23,37 @@ serving metrics, and the derived kernel policy without changing the conservative
 | `e2e_qwen3_4b_5090_repeat3.md` | Repeat-run end-to-end results with mean/p50/p95 |
 | `KERNEL_POLICY_REPORT.md` | Generated benchmark analysis report |
 | `kernel_policy_5090.json` | Generated kernel policy artifact |
-| `profile_qwen3_4b_5090.md` | Optional PyTorch profiler top-ops summary |
-| `profile_qwen3_4b_5090.json` | Optional Chrome trace exported by PyTorch profiler |
-| `upstream_vs_fork_qwen3_4b_5090.md` | Optional upstream nano-vLLM vs fork e2e comparison |
+| `profile_qwen3_4b_5090.md` | PyTorch profiler top-ops summary |
+| `profile_qwen3_4b_5090.json` | Chrome trace exported by PyTorch profiler; generated locally, not tracked |
+| `upstream_vs_fork_qwen3_4b_5090.md` | Upstream nano-vLLM vs fork e2e comparison |
+
+## Upstream vs Fork E2E
+
+Measured with Qwen3-4B, prompt length 512, 4 prompts, 128 generated tokens, `--enforce-eager`,
+1 warmup run, and 3 measured runs.
+
+| Metric | Upstream nano-vLLM | This fork | Delta |
+|---|---:|---:|---:|
+| Elapsed time | 3.3062 s | 2.4158 s | 1.369x lower |
+| Decode tokens/s | 157.5442 | 217.7530 | 1.382x higher |
+| Average ITL | 6.3477 ms | 4.5932 ms | 1.382x lower |
+| Decode step p95 | 26.4125 ms | 19.3240 ms | 1.367x lower |
+| Peak GPU memory | 27.4288 GB | 27.3754 GB | 1.002x lower |
+
+## Profiler Evidence
+
+The PyTorch profiler run captures 64 scheduler steps: 1 prefill step and 63 decode steps. The trace
+shows that Qwen3-4B decode is dominated by BF16 Linear/GEMM work:
+
+| Profiler item | CUDA time | Calls | Interpretation |
+|---|---:|---:|---|
+| `aten::mm` / `aten::linear` | 424.5 ms | 9,280 | Main decode bottleneck |
+| CUTLASS BF16 GEMM kernels | 421.6 ms | 9,280 | cuBLAS/CUTLASS linear backend dominates |
+| FlashAttention decode kernels | ~27.6 ms | 4,536 | Attention is not the first bottleneck here |
+| Triton SiLU/RMSNorm/RoPE/store kernels | ~36.1 ms | 13,888 | Useful but smaller contributors |
+
+This motivates keeping cuBLAS Linear as the production default while using the CUDA GEMM worklog as
+the next research track: vectorized loads, register tiling, and BF16 Tensor Core MMA.
 
 ## Headline Findings
 
@@ -37,6 +65,7 @@ serving metrics, and the derived kernel policy without changing the conservative
 | KV-cache store | Current 1D Triton store remains better than the experimental 2D store |
 | Linear/GEMV | cuBLAS remains the correct default on Qwen3-4B linear shapes |
 | CUDA GEMM | Naive/tiled CUDA kernels are research baselines, not production replacements |
+| E2E fork delta | 1.38x higher decode tokens/s than upstream on the measured workload |
 
 ## Reproduction
 
@@ -110,7 +139,6 @@ The default serving path stays conservative: FlashAttention 2, model-dtype KV ca
 
 ## Next Steps
 
-- Inspect the PyTorch profiler trace and summarize the dominant Qwen3-4B decode kernels.
-- Run the upstream-vs-fork comparison on the same RTX 5090 image and archive the generated report.
 - Implement optional backend dispatch only for safe layer kernels such as RMSNorm, activation, and RoPE.
 - Add a BF16 Tensor Core GEMM experiment before considering any Linear runtime integration.
+- Add Nsight Systems screenshots for launch overhead and decode-step timeline visualization.

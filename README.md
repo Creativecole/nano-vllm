@@ -96,12 +96,31 @@ See `bench.py` for benchmark.
 
 ## Qwen3-4B / RTX 5090 Kernel Work
 
-This fork focuses on measurable Triton kernel work first: every replacement path is checked against a
-PyTorch or torch.compile baseline before being used as a default. The current RTX 5090 / Qwen3-0.6B
-microbenchmarks show clear wins for normalization and activation kernels, while KV-cache store variants
-and GEMV experiments are kept out of the default path when they do not beat the baseline.
+This fork focuses on measurable kernel/backend work first: every replacement path is checked against a
+PyTorch, torch.compile, or cuBLAS baseline before being used as a default. The default runtime remains
+conservative, while benchmark and profiler artifacts document which kernels are worth pursuing.
 
-Measured on RTX 5090 with `python bench_kernels.py --min-run-time 1.0 --skip-sampler`:
+Measured on a single RTX 5090 with Qwen3-4B, prompt length 512, 4 prompts, 128 generated tokens,
+`--enforce-eager`, 1 warmup run, and 3 measured runs:
+
+| Metric | Upstream nano-vLLM | This fork | Delta |
+|---|---:|---:|---:|
+| Elapsed time | 3.3062 s | 2.4158 s | 1.369x lower |
+| Decode tokens/s | 157.5442 | 217.7530 | 1.382x higher |
+| Average ITL | 6.3477 ms | 4.5932 ms | 1.382x lower |
+| Decode step p95 | 26.4125 ms | 19.3240 ms | 1.367x lower |
+| Peak GPU memory | 27.4288 GB | 27.3754 GB | 1.002x lower |
+
+PyTorch profiler evidence for the same Qwen3-4B workload shows that decode time is dominated by
+BF16 Linear/GEMM work rather than attention. In a 64-step trace, `aten::mm` accounts for 424.5 ms of
+CUDA time across 9,280 calls, while FlashAttention decode kernels account for about 27.6 ms combined
+and the Triton RMSNorm/SiLU/RoPE/store kernels are smaller contributors. This points the next serious
+optimization effort toward BF16 Tensor Core GEMM / linear backend experiments instead of blindly
+rewriting attention.
+
+Model-shape-aware kernel microbenchmarks on RTX 5090 show clear wins for normalization and activation
+kernels, while KV-cache store variants and GEMV experiments are kept out of the default path when they
+do not beat the baseline:
 
 | Kernel | Baseline | Triton result | Default decision |
 |---|---|---:|---|
