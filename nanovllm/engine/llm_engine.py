@@ -67,6 +67,7 @@ class LLMEngine:
         metrics.update({
             "max_model_len": config.max_model_len,
             "kvcache_block_size": config.kvcache_block_size,
+            "model_dtype": str(config.hf_config.dtype).removeprefix("torch."),
             "kv_cache_dtype": str(config.hf_config.dtype).removeprefix("torch."),
             "norm_backend": config.norm_backend,
             "activation_backend": config.activation_backend,
@@ -74,6 +75,9 @@ class LLMEngine:
             "linear_backend": config.linear_backend,
         })
         return metrics
+
+    def get_cache_stats(self):
+        return self.scheduler.get_cache_stats()
 
     def generate(
         self,

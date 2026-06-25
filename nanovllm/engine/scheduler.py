@@ -19,8 +19,19 @@ class Scheduler:
     def is_finished(self):
         return not self.waiting and not self.running
 
+    def get_cache_stats(self):
+        stats = self.block_manager.get_cache_stats()
+        active_sequences = list(self.running) + list(self.waiting)
+        stats.update({
+            "active_sequences": len(active_sequences),
+            "allocated_blocks_per_sequence": {
+                seq.seq_id: len(seq.block_table) for seq in active_sequences if seq.block_table
+            },
+        })
+        return stats
+
     def metrics(self):
-        metrics = self.block_manager.metrics()
+        metrics = self.get_cache_stats()
         metrics.update({
             "max_num_seqs": self.max_num_seqs,
             "max_num_batched_tokens": self.max_num_batched_tokens,

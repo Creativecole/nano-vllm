@@ -6,16 +6,131 @@
 <a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </p>
 
-# Nano-vLLM
+# Nano-vLLM Inference Optimization Fork
 
-A lightweight vLLM implementation built from scratch.
+This repository is a lightweight LLM inference engineering project based on
+[nano-vLLM](https://github.com/GeeeekExplorer/nano-vllm). The goal is not to turn a small codebase
+into a full production serving stack. The goal is to make the core inference-engine tradeoffs visible:
+prefill vs decode, scheduler behavior, paged KV-cache allocation, prefix caching, CUDA Graph replay,
+FlashAttention integration, Triton kernels, cuBLAS baselines, and profile-first backend decisions.
 
-## Key Features
+Project framing:
 
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Triton kernels, CUDA graph, etc.
-* 🧪 **Qwen3-4B / RTX 5090 Profiling** - Model-shape-aware kernel, CUDA GEMM, and end-to-end benchmarks
+> Lightweight LLM Inference Engine Optimization based on nano-vLLM, focused on decode bottleneck
+> analysis, KV-cache observability, model-shape-aware backend/kernel policy, and end-to-end benchmark
+> methodology.
+
+The default serving path stays conservative: FlashAttention 2 for attention, model-dtype KV cache,
+and PyTorch/cuBLAS Linear. Custom Triton and CUDA kernels are benchmarked, tested, and documented
+before any runtime default is changed.
+
+## Project Overview
+
+This fork extends nano-vLLM in five areas:
+
+| Area | What this fork adds |
+|---|---|
+| Engine observability | KV-cache block stats, prefix-cache hit/miss counters, backend config in benchmark output |
+| Benchmark methodology | TTFT, ITL, prefill/decode time, decode tokens/s, peak memory, repeat/p50/p95 reporting |
+| Kernel study | Model-shape-aware Triton benchmarks for Qwen3 shapes and CUDA GEMM worklog versus cuBLAS |
+| Profiling evidence | PyTorch profiler trace/summary to identify whether bottlenecks are GEMM, attention, norms, sampling, or scheduler overhead |
+| Engineering documentation | Reproducible RTX 5090 / Qwen3-4B results, upstream comparison, kernel policy report, serving roadmap |
+
+## Architecture Overview
+
+```mermaid
+flowchart TD
+    A["Prompts / Requests"] --> B["LLM.generate / LLMEngine.step"]
+    B --> C["Scheduler"]
+    C --> D["BlockManager / Prefix Cache"]
+    D --> E["ModelRunner"]
+    E --> F["Qwen3 Model"]
+    F --> G["FlashAttention / Triton Kernels / cuBLAS Linear"]
+    G --> H["Sampler"]
+    H --> I["Generated Tokens"]
+    C --> J["Prefill vs Decode Decision"]
+    E --> K["CUDA Graph Decode Path"]
+    D --> L["Paged KV Cache Blocks"]
+```
+
+Runtime flow:
+
+1. `LLM.generate()` converts prompts into `Sequence` objects.
+2. `Scheduler.schedule()` chooses prefill or decode and enforces batch/token budgets.
+3. `BlockManager` allocates paged KV-cache blocks and checks full-block prefix-cache reuse.
+4. `ModelRunner` prepares tensors, runs Qwen3, optionally replays CUDA Graphs for decode, and calls the sampler.
+5. Attention uses FlashAttention varlen/paged KV APIs, while layer kernels and linear paths are measured separately.
+
+## Optimization Methodology
+
+This repo follows a profile-first loop:
+
+```text
+profile -> identify bottleneck -> microbenchmark -> correctness test -> e2e benchmark -> decide default vs experimental path
+```
+
+The important rule is restraint: a custom kernel is not a production replacement just because it exists.
+If a Triton/CUDA path does not beat FlashAttention or cuBLAS on the measured workload, it stays as a
+worklog or benchmark artifact.
+
+## Benchmark Metrics
+
+| Metric | Meaning |
+|---|---|
+| TTFT | Time to first generated token, including prompt prefill and first decode step |
+| ITL | Inter-token latency during decode, reported in milliseconds per generated token |
+| Decode tokens/s | Generated decode tokens divided by measured decode time |
+| Prefill time | Time spent processing prompt tokens and writing KV cache |
+| Decode time | Time spent generating new tokens after prefill |
+| Peak GPU memory | `torch.cuda.max_memory_allocated()` during the benchmark run |
+| KV-cache total blocks | Number of paged KV blocks allocated from available GPU memory |
+| KV-cache used/free blocks | Runtime block usage from `BlockManager` |
+| Block utilization | Used blocks divided by total blocks; max utilization is tracked across the run |
+| Prefix-cache hit rate | Full KV block reuse hits divided by hits plus misses |
+
+## Kernel / Backend Policy
+
+| Component | Default policy | Experimental policy |
+|---|---|---|
+| Attention | FlashAttention 2 remains default | Custom attention only after correctness and e2e wins |
+| Linear / GEMM | PyTorch `F.linear` / cuBLAS remains default | CUDA GEMM and Triton GEMM stay in benchmarks until faster |
+| KV cache dtype | Model dtype, usually BF16 for Qwen3 | Quantized KV cache is not a current default path |
+| RMSNorm / AddRMSNorm | Triton path is measured and tested | Keep torch fallback available |
+| SiLU-and-Mul | Triton path is measured and tested | Shape-sensitive; benchmark before enabling broadly |
+| RoPE | Triton path is measured and tested | Large-shape regressions are documented |
+| KV-cache store variants | 1D Triton store remains the baseline in this fork | 2D/TMA-style experiments stay research-only |
+
+## Results
+
+Curated RTX 5090 / Qwen3-4B artifacts live in
+[results/rtx5090_qwen3_4b](results/rtx5090_qwen3_4b/README.md).
+
+Measured on a single RTX 5090 with Qwen3-4B, prompt length 512, 4 prompts, 128 generated tokens,
+`--enforce-eager`, 1 warmup run, and 3 measured runs:
+
+| Metric | Upstream nano-vLLM | This fork | Delta |
+|---|---:|---:|---:|
+| Elapsed time | 3.3062 s | 2.4158 s | 1.369x lower |
+| Decode tokens/s | 157.5442 | 217.7530 | 1.382x higher |
+| Average ITL | 6.3477 ms | 4.5932 ms | 1.382x lower |
+| Decode step p95 | 26.4125 ms | 19.3240 ms | 1.367x lower |
+| Peak GPU memory | 27.4288 GB | 27.3754 GB | 1.002x lower |
+
+Profiler evidence for the same Qwen3-4B workload shows that decode time is dominated by BF16
+Linear/GEMM work. In a 64-step PyTorch profiler trace, `aten::mm` accounts for 424.5 ms of CUDA time
+across 9,280 calls, while FlashAttention decode kernels account for about 27.6 ms combined. This is
+why the next serious kernel track is BF16 Tensor Core GEMM rather than a blind attention rewrite.
+
+Key result files:
+
+| File | Purpose |
+|---|---|
+| [kernels_qwen3_4b_5090.md](results/rtx5090_qwen3_4b/kernels_qwen3_4b_5090.md) | Model-shape-aware Triton/cuBLAS microbenchmarks |
+| [cuda_gemm_qwen3_4b_5090.md](results/rtx5090_qwen3_4b/cuda_gemm_qwen3_4b_5090.md) | CUDA naive/tiled GEMM worklog versus cuBLAS |
+| [e2e_qwen3_4b_5090_repeat3.md](results/rtx5090_qwen3_4b/e2e_qwen3_4b_5090_repeat3.md) | Repeat e2e benchmark with mean/p50/p95 |
+| [profile_qwen3_4b_5090.md](results/rtx5090_qwen3_4b/profile_qwen3_4b_5090.md) | PyTorch profiler top-ops summary |
+| [upstream_vs_fork_qwen3_4b_5090.md](results/rtx5090_qwen3_4b/upstream_vs_fork_qwen3_4b_5090.md) | Upstream vs fork e2e comparison |
+| [KERNEL_POLICY_REPORT.md](results/rtx5090_qwen3_4b/KERNEL_POLICY_REPORT.md) | Generated backend/kernel policy report |
 
 ## Installation
 
@@ -33,152 +148,149 @@ Or install directly from this fork:
 pip install git+https://github.com/Creativecole/nano-vllm.git
 ```
 
-This fork keeps the serving path on FlashAttention 2, model-dtype KV cache, and cuBLAS Linear for
-reproducible results. Experimental kernels are developed behind benchmarks before they are considered
-for the default inference path.
-
-The fork is intentionally a lightweight extension of nano-vLLM rather than a rewrite. Kernel backend
-configuration is exposed through `Config`, while the default runtime remains conservative:
-
-| Component | Default | Notes |
-|---|---|---|
-| Attention | FlashAttention 2 | Existing paged KV-cache decode path |
-| KV cache | model dtype | Usually BF16 for Qwen3 checkpoints |
-| Linear | cuBLAS / `F.linear` | Custom GEMM kernels stay in benchmarks until proven faster |
-| RMSNorm / SiLU / RoPE | Triton | Covered by correctness tests and microbenchmarks |
-
-## Model Download
-
-To download the Qwen3-0.6B example model manually, use:
+Download an example model:
 
 ```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
+hf download Qwen/Qwen3-0.6B --local-dir ../models/Qwen3-0.6B
+hf download Qwen/Qwen3-4B --local-dir ../models/Qwen3-4B
 ```
 
-Larger compatible dense Qwen3 CausalLM checkpoints can also be used by passing their local directory to
-`LLM`, for example `/path/to/Qwen3-4B`. Hybrid checkpoints with `linear_attn` weights need a separate
-model adapter and are intentionally rejected by this fork.
+Hybrid checkpoints with `linear_attn` weights need a separate model adapter and are intentionally
+rejected by this fork.
 
 ## Quick Start
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
 ```python
 from nanovllm import LLM, SamplingParams
+
 llm = LLM(
     "/YOUR/MODEL/PATH",
     enforce_eager=True,
     tensor_parallel_size=1,
 )
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
+outputs = llm.generate(["Hello, Nano-vLLM."], sampling_params)
 outputs[0]["text"]
 ```
 
-## Benchmark
+## How To Reproduce
 
-See `bench.py` for benchmark.
-
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
-
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
-
-## Qwen3-4B / RTX 5090 Kernel Work
-
-This fork focuses on measurable kernel/backend work first: every replacement path is checked against a
-PyTorch, torch.compile, or cuBLAS baseline before being used as a default. The default runtime remains
-conservative, while benchmark and profiler artifacts document which kernels are worth pursuing.
-
-Measured on a single RTX 5090 with Qwen3-4B, prompt length 512, 4 prompts, 128 generated tokens,
-`--enforce-eager`, 1 warmup run, and 3 measured runs:
-
-| Metric | Upstream nano-vLLM | This fork | Delta |
-|---|---:|---:|---:|
-| Elapsed time | 3.3062 s | 2.4158 s | 1.369x lower |
-| Decode tokens/s | 157.5442 | 217.7530 | 1.382x higher |
-| Average ITL | 6.3477 ms | 4.5932 ms | 1.382x lower |
-| Decode step p95 | 26.4125 ms | 19.3240 ms | 1.367x lower |
-| Peak GPU memory | 27.4288 GB | 27.3754 GB | 1.002x lower |
-
-PyTorch profiler evidence for the same Qwen3-4B workload shows that decode time is dominated by
-BF16 Linear/GEMM work rather than attention. In a 64-step trace, `aten::mm` accounts for 424.5 ms of
-CUDA time across 9,280 calls, while FlashAttention decode kernels account for about 27.6 ms combined
-and the Triton RMSNorm/SiLU/RoPE/store kernels are smaller contributors. This points the next serious
-optimization effort toward BF16 Tensor Core GEMM / linear backend experiments instead of blindly
-rewriting attention.
-
-Model-shape-aware kernel microbenchmarks on RTX 5090 show clear wins for normalization and activation
-kernels, while KV-cache store variants and GEMV experiments are kept out of the default path when they
-do not beat the baseline:
-
-| Kernel | Baseline | Triton result | Default decision |
-|---|---|---:|---|
-| RMSNorm | torch.compile | up to 2.95x faster | Enabled |
-| Add + RMSNorm | torch.compile | up to 2.21x faster | Enabled |
-| SiLU-and-Mul | torch.compile | up to 1.83x faster | Enabled |
-| RoPE | torch.compile | up to 1.18x faster | Enabled |
-| KV-cache store 2D grid | 1D Triton store | ~0.84-0.86x | Experimental only |
-| Linear GEMV | `torch.nn.functional.linear` / cuBLAS | ~0.27-0.36x | Disabled by default |
-
-The repo also includes a standalone CUDA C++ GEMM worklog benchmark. It starts with a naive FP32 GEMM
-kernel and a shared-memory tiled GEMM kernel, then compares both against `torch.matmul` / cuBLAS on
-Qwen3-like linear-layer shapes. This is kept separate from `LinearBase` because cuBLAS remains the
-production baseline until a custom BF16 Tensor Core kernel proves faster.
-
-Useful commands:
+Run CPU-safe and GPU kernel tests:
 
 ```bash
+pytest tests/test_block_manager.py
 pytest tests/test_kernels.py
-python bench_kernels.py --min-run-time 1.0 --skip-sampler --output kernels_5090_qwen3_0.6b.md
-python bench_kernels.py --model /path/to/Qwen3-4B --min-run-time 1.0 --skip-sampler --output kernels_qwen3_4b_5090.md
-python bench_cuda_gemm.py --min-run-time 1.0 --output cuda_gemm_5090.md
-python bench_cuda_gemm.py --model /path/to/Qwen3-4B --min-run-time 1.0 --output cuda_gemm_qwen3_4b_5090.md
-python bench_e2e.py --model /path/to/Qwen3-4B --prompt-len 512 --num-prompts 4 --max-tokens 128 --enforce-eager --output e2e_qwen3_4b_5090.md
-python profile_e2e.py --model /path/to/Qwen3-4B --prompt-len 512 --num-prompts 4 --max-tokens 128 --enforce-eager --profile-steps 64 --profile-memory --record-shapes --trace-output profile_qwen3_4b_5090.json --summary-output profile_qwen3_4b_5090.md
-python compare_upstream.py --upstream-repo /path/to/upstream/nano-vllm --model /path/to/Qwen3-4B --prompt-len 512 --num-prompts 4 --max-tokens 128 --enforce-eager --repeat 3 --warmup 1 --output upstream_vs_fork_qwen3_4b_5090.md
-python analyze_kernel_results.py --kernel-results kernels_qwen3_4b_5090.md --cuda-gemm-results cuda_gemm_qwen3_4b_5090.md --e2e-results e2e_qwen3_4b_5090.md --output KERNEL_POLICY_REPORT.md --policy-output kernel_policy_5090.json
+NANOVLLM_TEST_MODEL=../models/Qwen3-0.6B pytest tests/test_integration.py -q
 ```
 
-`bench_kernels.py` prints a Markdown summary table with median latency, speedup, and correctness status.
-When `--model` is provided, it derives Qwen layer shapes from the checkpoint config: RMSNorm, AddRMSNorm,
-SiLU-and-Mul, RoPE, KV-cache store, QKV/O projection, and MLP gate/up/down linear shapes.
+Run model-shape-aware kernel microbenchmarks:
 
-`bench_cuda_gemm.py` JIT-compiles the CUDA extension in `csrc/cuda_gemm_kernel.cu` and reports latency,
-GFLOP/s, speedup versus cuBLAS, and correctness for each Qwen linear-layer shape. It is a CUDA GEMM
-worklog, not a production `LinearBase` replacement. The next optimization steps are vectorized global
-loads, register tiling, BF16 Tensor Core MMA, and comparison with Triton `tl.dot` and cuBLAS.
+```bash
+python bench_kernels.py \
+  --model ../models/Qwen3-4B \
+  --min-run-time 1.0 \
+  --skip-sampler \
+  --output results/rtx5090_qwen3_4b/kernels_qwen3_4b_5090.md
+```
 
-`bench_e2e.py` runs real nano-vLLM generation through the scheduler loop and reports elapsed time, TTFT,
-prefill/decode time, decode tokens/s, ITL, peak GPU memory, KV-cache block counts, block utilization,
-prefix-cache hit/miss counters, and the active backend configuration.
+Run CUDA GEMM worklog benchmarks:
 
-`profile_e2e.py` runs the same scheduler-loop workload under PyTorch profiler, exports a Chrome trace,
-and writes a top-ops summary sorted by CUDA time. This is intended to show where time is spent rather
-than only reporting aggregate throughput.
+```bash
+python bench_cuda_gemm.py \
+  --model ../models/Qwen3-4B \
+  --min-run-time 1.0 \
+  --output results/rtx5090_qwen3_4b/cuda_gemm_qwen3_4b_5090.md
+```
 
-`compare_upstream.py` runs an upstream nano-vLLM checkout and this fork in isolated Python subprocesses
-with the same Qwen3-4B prompt/decode configuration, then writes an upstream-vs-fork Markdown comparison.
+Run end-to-end generation benchmark with Markdown and JSON output:
 
-`analyze_kernel_results.py` turns the three benchmark result files into a Markdown report and
-`kernel_policy_5090.json`. The generated policy is an analysis artifact only; it is not wired into
-runtime dispatch.
+```bash
+python bench_e2e.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-new-tokens 128 \
+  --enforce-eager \
+  --warmup 1 \
+  --repeat 3 \
+  --save-md results/rtx5090_qwen3_4b/e2e_qwen3_4b_5090_repeat3.md \
+  --save-json results/rtx5090_qwen3_4b/e2e_qwen3_4b_5090_repeat3.json
+```
 
-Curated RTX 5090 / Qwen3-4B results are available in `results/rtx5090_qwen3_4b/`.
+Run prefix-cache workloads:
 
-Future work includes model-shape-aware kernel autotuning, BF16 Tensor Core GEMM experiments, and
-additional scheduler / KV-cache observability for Qwen3-4B workloads.
+```bash
+python bench_prefix_cache.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-tokens 128 \
+  --enforce-eager \
+  --save-md results/rtx5090_qwen3_4b/prefix_cache_qwen3_4b_5090.md \
+  --save-json results/rtx5090_qwen3_4b/prefix_cache_qwen3_4b_5090.json
+```
 
+Capture a PyTorch profiler trace:
+
+```bash
+python profile_e2e.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-tokens 128 \
+  --enforce-eager \
+  --profile-steps 64 \
+  --profile-memory \
+  --record-shapes \
+  --trace-output results/rtx5090_qwen3_4b/profile_qwen3_4b_5090.json \
+  --summary-output results/rtx5090_qwen3_4b/profile_qwen3_4b_5090.md
+```
+
+Compare against an upstream checkout:
+
+```bash
+cd ..
+git clone https://github.com/GeeeekExplorer/nano-vllm.git nano-vllm-upstream
+cd nano-vllm
+python compare_upstream.py \
+  --upstream-repo ../nano-vllm-upstream \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-tokens 128 \
+  --enforce-eager \
+  --warmup 1 \
+  --repeat 3 \
+  --output results/rtx5090_qwen3_4b/upstream_vs_fork_qwen3_4b_5090.md
+```
+
+Generate the backend/kernel policy report:
+
+```bash
+python analyze_kernel_results.py \
+  --kernel-results results/rtx5090_qwen3_4b/kernels_qwen3_4b_5090.md \
+  --cuda-gemm-results results/rtx5090_qwen3_4b/cuda_gemm_qwen3_4b_5090.md \
+  --e2e-results results/rtx5090_qwen3_4b/e2e_qwen3_4b_5090.md \
+  --output results/rtx5090_qwen3_4b/KERNEL_POLICY_REPORT.md \
+  --policy-output results/rtx5090_qwen3_4b/kernel_policy_5090.json
+```
+
+## Script Map
+
+| Script | Role |
+|---|---|
+| `bench_e2e.py` | End-to-end scheduler-loop benchmark with TTFT/ITL/KV stats |
+| `bench_prefix_cache.py` | Prefix-cache behavior benchmark across prompt-sharing workloads |
+| `bench_kernels.py` | Triton microbenchmarks using Qwen model shapes |
+| `bench_cuda_gemm.py` | CUDA C++ GEMM worklog versus cuBLAS |
+| `profile_e2e.py` | PyTorch profiler trace and top-op summary |
+| `compare_upstream.py` | Same-workload upstream vs fork comparison |
+| `analyze_kernel_results.py` | Markdown/JSON kernel policy report generator |
+
+## Serving Roadmap
+
+See [docs/serving_roadmap.md](docs/serving_roadmap.md) for the optional online serving plan. The
+current project remains focused on offline inference benchmarking and kernel/backend analysis.
 
 ## Star History
 

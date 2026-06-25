@@ -31,6 +31,57 @@ def markdown_table(row: dict) -> str:
     return "\n".join(lines)
 
 
+def markdown_rows(rows: list[dict], columns: list[str]) -> str:
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(format_value(row.get(column, "")) for column in columns) + " |")
+    return "\n".join(lines)
+
+
+def categorize_op(name: str) -> str:
+    lowered = name.lower()
+    if "nano_vllm_engine_step" in lowered:
+        return "Profiler wrapper"
+    if any(token in lowered for token in ("cutlass", "cublas", "gemm", "aten::mm", "matmul", "aten::linear")):
+        return "Linear/GEMM"
+    if "flash" in lowered or "attn" in lowered:
+        return "Attention"
+    if "rms_norm" in lowered or "layer_norm" in lowered:
+        return "Normalization"
+    if "silu" in lowered or "gelu" in lowered:
+        return "Activation"
+    if "rotary" in lowered or "rope" in lowered:
+        return "RoPE"
+    if "store_kvcache" in lowered or "kvcache" in lowered:
+        return "KV cache store"
+    if any(token in lowered for token in ("argmax", "softmax", "sample", "sampler")):
+        return "Sampling"
+    if "cuda" in lowered and "launch" in lowered:
+        return "Kernel launch"
+    return "Other"
+
+
+def summarize_profiler_categories(prof) -> list[dict]:
+    categories = {}
+    for event in prof.key_averages():
+        category = categorize_op(event.key)
+        if category == "Profiler wrapper":
+            continue
+        entry = categories.setdefault(category, {
+            "category": category,
+            "self_cuda_time_ms": 0.0,
+            "self_cpu_time_ms": 0.0,
+            "calls": 0,
+        })
+        entry["self_cuda_time_ms"] += getattr(event, "self_cuda_time_total", getattr(event, "cuda_time_total", 0.0)) / 1000.0
+        entry["self_cpu_time_ms"] += getattr(event, "self_cpu_time_total", getattr(event, "cpu_time_total", 0.0)) / 1000.0
+        entry["calls"] += getattr(event, "count", 0)
+    return sorted(categories.values(), key=lambda row: row["self_cuda_time_ms"], reverse=True)
+
+
 def run_warmup(llm, prompts: list[list[int]], sampling_params, steps: int):
     if steps <= 0:
         return
@@ -82,6 +133,7 @@ def run_profile(llm, prompts: list[list[int]], sampling_params, args):
 
     sort_by = "cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
     op_table = prof.key_averages().table(sort_by=sort_by, row_limit=args.row_limit)
+    category_rows = summarize_profiler_categories(prof)
     return {
         "summary": {
             "model": args.model,
@@ -101,6 +153,7 @@ def run_profile(llm, prompts: list[list[int]], sampling_params, args):
             "with_stack": args.with_stack,
         },
         "op_table": op_table,
+        "category_rows": category_rows,
     }
 
 
@@ -160,6 +213,8 @@ def main():
     text = "\n\n".join([
         "# nano-vLLM E2E PyTorch Profiler",
         markdown_table(result["summary"]),
+        "## Bottleneck Categories",
+        markdown_rows(result["category_rows"], ["category", "self_cuda_time_ms", "self_cpu_time_ms", "calls"]),
         "## Top Ops",
         "```text\n" + result["op_table"] + "\n```",
     ])

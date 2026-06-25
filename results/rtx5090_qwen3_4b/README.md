@@ -26,6 +26,7 @@ serving metrics, and the derived kernel policy without changing the conservative
 | `profile_qwen3_4b_5090.md` | PyTorch profiler top-ops summary |
 | `profile_qwen3_4b_5090.json` | Chrome trace exported by PyTorch profiler; generated locally, not tracked |
 | `upstream_vs_fork_qwen3_4b_5090.md` | Upstream nano-vLLM vs fork e2e comparison |
+| `prefix_cache_qwen3_4b_5090.md` | Optional prefix-cache workload benchmark |
 
 ## Upstream vs Fork E2E
 
@@ -114,6 +115,15 @@ python compare_upstream.py \
   --repeat 3 \
   --output results/rtx5090_qwen3_4b/upstream_vs_fork_qwen3_4b_5090.md
 
+python bench_prefix_cache.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-tokens 128 \
+  --enforce-eager \
+  --save-md results/rtx5090_qwen3_4b/prefix_cache_qwen3_4b_5090.md \
+  --save-json results/rtx5090_qwen3_4b/prefix_cache_qwen3_4b_5090.json
+
 python analyze_kernel_results.py \
   --kernel-results results/rtx5090_qwen3_4b/kernels_qwen3_4b_5090.md \
   --cuda-gemm-results results/rtx5090_qwen3_4b/cuda_gemm_qwen3_4b_5090.md \
@@ -131,6 +141,7 @@ python analyze_kernel_results.py \
 | CUDA GEMM | Not included | Standalone CUDA GEMM worklog benchmark against cuBLAS |
 | Observability | Minimal runtime counters | Block utilization, max block usage, prefix-cache hit/miss counters |
 | Policy artifact | Not included | Generated Markdown report and JSON kernel policy |
+| Prefix-cache benchmark | Not included | Dedicated prompt-sharing workloads with hit/miss counters |
 
 ## Runtime Scope
 

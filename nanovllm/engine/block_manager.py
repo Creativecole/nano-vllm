@@ -1,6 +1,11 @@
 from collections import deque
-import xxhash
+import hashlib
 import numpy as np
+
+try:
+    import xxhash
+except ImportError:  # pragma: no cover - exercised only in minimal dev environments
+    xxhash = None
 
 from nanovllm.engine.sequence import Sequence
 
@@ -40,6 +45,13 @@ class BlockManager:
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+        if xxhash is None:
+            h = hashlib.blake2b(digest_size=8)
+            if prefix != -1:
+                h.update(prefix.to_bytes(8, "little"))
+            h.update(np.array(token_ids).tobytes())
+            return int.from_bytes(h.digest(), "little")
+
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
@@ -129,13 +141,14 @@ class BlockManager:
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
 
-    def metrics(self):
+    def get_cache_stats(self):
         total_blocks = len(self.blocks)
         used_blocks = len(self.used_block_ids)
         free_blocks = len(self.free_block_ids)
         prefix_total = self.prefix_cache_hits + self.prefix_cache_misses
         hit_rate = self.prefix_cache_hits / prefix_total if prefix_total else 0.0
         return {
+            "total_blocks": total_blocks,
             "num_kvcache_blocks": total_blocks,
             "used_blocks": used_blocks,
             "free_blocks": free_blocks,
@@ -146,3 +159,6 @@ class BlockManager:
             "prefix_cache_misses": self.prefix_cache_misses,
             "prefix_cache_hit_rate": hit_rate,
         }
+
+    def metrics(self):
+        return self.get_cache_stats()

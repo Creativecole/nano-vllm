@@ -1,5 +1,7 @@
 import argparse
+import json
 from pathlib import Path
+import subprocess
 from statistics import mean
 from time import perf_counter
 
@@ -61,6 +63,17 @@ def aggregate_rows(rows: list[dict], keys: list[str]) -> list[dict]:
             "p95": percentile(values, 95),
         })
     return aggregate
+
+
+def get_git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "unknown"
 
 
 def run_profiled_generation(llm, prompts: list[list[int]], sampling_params):
@@ -142,11 +155,14 @@ def run_once(args, run_index: int, LLM, SamplingParams):
         kv_dtype = metrics["kv_cache_dtype"]
         return {
             "run": run_index,
+            "git_commit": get_git_commit(),
             "model": args.model,
             "gpu": torch.cuda.get_device_name(),
+            "model_dtype": metrics.get("model_dtype", kv_dtype),
             "prompt_len": args.prompt_len,
             "num_prompts": args.num_prompts,
             "max_tokens": args.max_tokens,
+            "max_new_tokens": args.max_tokens,
             "elapsed_s": result["elapsed_s"],
             "ttft_s": result["ttft_s"],
             "prefill_time_s": result["prefill_time_s"],
@@ -169,6 +185,8 @@ def run_once(args, run_index: int, LLM, SamplingParams):
             "block_utilization": metrics["block_utilization"],
             "max_used_blocks": metrics["max_used_blocks"],
             "max_block_utilization": metrics["max_block_utilization"],
+            "active_sequences": metrics.get("active_sequences", 0),
+            "allocated_blocks_per_sequence": metrics.get("allocated_blocks_per_sequence", {}),
             "prefix_cache_hits": metrics["prefix_cache_hits"],
             "prefix_cache_misses": metrics["prefix_cache_misses"],
             "prefix_cache_hit_rate": metrics["prefix_cache_hit_rate"],
@@ -207,6 +225,7 @@ def format_benchmark_output(rows: list[dict]) -> str:
     ]
     run_columns = [
         "run",
+        "generated_tokens",
         "elapsed_s",
         "ttft_s",
         "prefill_time_s",
@@ -216,15 +235,21 @@ def format_benchmark_output(rows: list[dict]) -> str:
         "decode_step_ms_p50",
         "decode_step_ms_p95",
         "peak_gpu_memory_gb",
+        "num_kvcache_blocks",
+        "used_blocks",
+        "free_blocks",
         "max_used_blocks",
         "max_block_utilization",
+        "prefix_cache_hit_rate",
     ]
     config_keys = [
+        "git_commit",
         "model",
         "gpu",
         "prompt_len",
         "num_prompts",
         "max_tokens",
+        "model_dtype",
         "kv_cache_dtype",
         "linear_backend",
         "norm_backend",
@@ -248,11 +273,14 @@ def main():
     parser.add_argument("--prompt-len", type=int, default=512)
     parser.add_argument("--num-prompts", type=int, default=4)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--max-new-tokens", dest="max_tokens", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=0)
-    parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--output", type=str, default=None, help="Deprecated alias for --save-md.")
+    parser.add_argument("--save-md", type=str, default=None)
+    parser.add_argument("--save-json", type=str, default=None)
     args = parser.parse_args()
 
     assert args.repeat >= 1
@@ -274,11 +302,33 @@ def main():
 
     text = format_benchmark_output(rows)
     print(text)
-    if args.output:
-        output_path = Path(args.output)
+    md_output = args.save_md or args.output
+    if md_output:
+        output_path = Path(md_output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(text + "\n", encoding="utf-8")
         print(f"\nSaved Markdown summary to {output_path}")
+    if args.save_json:
+        output_path = Path(args.save_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps({
+            "benchmark": "bench_e2e",
+            "runs": rows,
+            "aggregate": aggregate_rows(rows, [
+                "elapsed_s",
+                "ttft_s",
+                "prefill_time_s",
+                "decode_time_s",
+                "decode_tokens_per_s",
+                "itl_ms_avg",
+                "decode_step_ms_p50",
+                "decode_step_ms_p95",
+                "peak_gpu_memory_gb",
+                "max_used_blocks",
+                "max_block_utilization",
+            ]),
+        }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"Saved JSON summary to {output_path}")
 
 
 if __name__ == "__main__":
