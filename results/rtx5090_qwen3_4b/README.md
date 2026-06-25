@@ -26,7 +26,7 @@ serving metrics, and the derived kernel policy without changing the conservative
 | `profile_qwen3_4b_5090.md` | PyTorch profiler top-ops summary |
 | `profile_qwen3_4b_5090.json` | Chrome trace exported by PyTorch profiler; generated locally, not tracked |
 | `upstream_vs_fork_qwen3_4b_5090.md` | Upstream nano-vLLM vs fork e2e comparison |
-| `prefix_cache_qwen3_4b_5090.md` | Optional prefix-cache workload benchmark |
+| `prefix_cache_qwen3_4b_5090.md` | Prefix-cache workload benchmark |
 
 ## Upstream vs Fork E2E
 
@@ -35,11 +35,25 @@ Measured with Qwen3-4B, prompt length 512, 4 prompts, 128 generated tokens, `--e
 
 | Metric | Upstream nano-vLLM | This fork | Delta |
 |---|---:|---:|---:|
-| Elapsed time | 3.3062 s | 2.4158 s | 1.369x lower |
-| Decode tokens/s | 157.5442 | 217.7530 | 1.382x higher |
-| Average ITL | 6.3477 ms | 4.5932 ms | 1.382x lower |
-| Decode step p95 | 26.4125 ms | 19.3240 ms | 1.367x lower |
+| Elapsed time | 5.5611 s | 3.2961 s | 1.687x lower |
+| Decode tokens/s | 92.9235 | 160.2852 | 1.725x higher |
+| Average ITL | 10.7815 ms | 6.3258 ms | 1.704x lower |
+| Decode step p95 | 45.6434 ms | 25.9239 ms | 1.761x lower |
 | Peak GPU memory | 27.4288 GB | 27.3754 GB | 1.002x lower |
+
+## Prefix Cache Workloads
+
+| Workload | TTFT | Decode tokens/s | Prefix hit rate | Interpretation |
+|---|---:|---:|---:|---|
+| no shared prefix | 374.4 ms | 115.9 | 0.00 | Distinct prompts do not reuse full KV blocks |
+| shared system prompt | 210.7 ms | 122.6 | 1.00 | Shared system blocks reduce prefill cost |
+| shared few-shot prefix | 65.3 ms | 168.8 | 1.00 | Longer shared prefix gives the largest TTFT win |
+| long prompt, short decode | 190.6 ms | 166.7 | 0.80 | Long prompts benefit from prefix reuse |
+| short prompt, long decode | 54.6 ms | 167.0 | 0.00 | Short prompts have too few full blocks to reuse |
+
+Compared with no shared prefix, the shared few-shot workload reduces TTFT by about 5.7x and increases
+decode throughput by about 1.46x. This is why the fork exposes prefix-cache hit/miss counters and KV
+block utilization instead of treating KV cache as an invisible implementation detail.
 
 ## Profiler Evidence
 
@@ -48,10 +62,10 @@ shows that Qwen3-4B decode is dominated by BF16 Linear/GEMM work:
 
 | Profiler item | CUDA time | Calls | Interpretation |
 |---|---:|---:|---|
-| `aten::mm` / `aten::linear` | 424.5 ms | 9,280 | Main decode bottleneck |
-| CUTLASS BF16 GEMM kernels | 421.6 ms | 9,280 | cuBLAS/CUTLASS linear backend dominates |
-| FlashAttention decode kernels | ~27.6 ms | 4,536 | Attention is not the first bottleneck here |
-| Triton SiLU/RMSNorm/RoPE/store kernels | ~36.1 ms | 13,888 | Useful but smaller contributors |
+| `aten::mm` / `aten::linear` | ~422 ms | 9,280 | Main decode bottleneck |
+| CUTLASS BF16 GEMM kernels | ~419 ms | 9,280 | cuBLAS/CUTLASS linear backend dominates |
+| FlashAttention decode kernels | ~27 ms | 4,536 | Attention is not the first bottleneck here |
+| Triton SiLU/RMSNorm/RoPE/store kernels | ~35 ms | 13,888 | Useful but smaller contributors |
 
 This motivates keeping cuBLAS Linear as the production default while using the CUDA GEMM worklog as
 the next research track: vectorized loads, register tiling, and BF16 Tensor Core MMA.
@@ -66,7 +80,8 @@ the next research track: vectorized loads, register tiling, and BF16 Tensor Core
 | KV-cache store | Current 1D Triton store remains better than the experimental 2D store |
 | Linear/GEMV | cuBLAS remains the correct default on Qwen3-4B linear shapes |
 | CUDA GEMM | Naive/tiled CUDA kernels are research baselines, not production replacements |
-| E2E fork delta | 1.38x higher decode tokens/s than upstream on the measured workload |
+| E2E fork delta | 1.73x higher decode tokens/s than upstream on the measured workload |
+| Prefix cache | Shared few-shot prefix reduces TTFT by about 5.7x versus no shared prefix |
 
 ## Reproduction
 

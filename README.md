@@ -110,15 +110,20 @@ Measured on a single RTX 5090 with Qwen3-4B, prompt length 512, 4 prompts, 128 g
 
 | Metric | Upstream nano-vLLM | This fork | Delta |
 |---|---:|---:|---:|
-| Elapsed time | 3.3062 s | 2.4158 s | 1.369x lower |
-| Decode tokens/s | 157.5442 | 217.7530 | 1.382x higher |
-| Average ITL | 6.3477 ms | 4.5932 ms | 1.382x lower |
-| Decode step p95 | 26.4125 ms | 19.3240 ms | 1.367x lower |
+| Elapsed time | 5.5611 s | 3.2961 s | 1.687x lower |
+| Decode tokens/s | 92.9235 | 160.2852 | 1.725x higher |
+| Average ITL | 10.7815 ms | 6.3258 ms | 1.704x lower |
+| Decode step p95 | 45.6434 ms | 25.9239 ms | 1.761x lower |
 | Peak GPU memory | 27.4288 GB | 27.3754 GB | 1.002x lower |
 
+Prefix-cache workloads make KV-cache behavior visible instead of treating it as hidden engine state.
+Compared with a no-shared-prefix workload, a shared few-shot prefix reduces TTFT from 374.4 ms to
+65.3 ms and improves decode throughput from 115.9 to 168.8 tokens/s. This is the serving-system reason
+to expose prefix hits, misses, hit rate, and block utilization in benchmark output.
+
 Profiler evidence for the same Qwen3-4B workload shows that decode time is dominated by BF16
-Linear/GEMM work. In a 64-step PyTorch profiler trace, `aten::mm` accounts for 424.5 ms of CUDA time
-across 9,280 calls, while FlashAttention decode kernels account for about 27.6 ms combined. This is
+Linear/GEMM work. In a 64-step PyTorch profiler trace, `aten::mm` accounts for about 422 ms of CUDA
+time across 9,280 calls, while FlashAttention decode kernels account for about 27 ms combined. This is
 why the next serious kernel track is BF16 Tensor Core GEMM rather than a blind attention rewrite.
 
 Key result files:
@@ -128,6 +133,7 @@ Key result files:
 | [kernels_qwen3_4b_5090.md](results/rtx5090_qwen3_4b/kernels_qwen3_4b_5090.md) | Model-shape-aware Triton/cuBLAS microbenchmarks |
 | [cuda_gemm_qwen3_4b_5090.md](results/rtx5090_qwen3_4b/cuda_gemm_qwen3_4b_5090.md) | CUDA naive/tiled GEMM worklog versus cuBLAS |
 | [e2e_qwen3_4b_5090_repeat3.md](results/rtx5090_qwen3_4b/e2e_qwen3_4b_5090_repeat3.md) | Repeat e2e benchmark with mean/p50/p95 |
+| [prefix_cache_qwen3_4b_5090.md](results/rtx5090_qwen3_4b/prefix_cache_qwen3_4b_5090.md) | Prefix-cache workload benchmark, generated from `bench_prefix_cache.py` |
 | [profile_qwen3_4b_5090.md](results/rtx5090_qwen3_4b/profile_qwen3_4b_5090.md) | PyTorch profiler top-ops summary |
 | [upstream_vs_fork_qwen3_4b_5090.md](results/rtx5090_qwen3_4b/upstream_vs_fork_qwen3_4b_5090.md) | Upstream vs fork e2e comparison |
 | [KERNEL_POLICY_REPORT.md](results/rtx5090_qwen3_4b/KERNEL_POLICY_REPORT.md) | Generated backend/kernel policy report |

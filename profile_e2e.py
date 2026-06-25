@@ -64,6 +64,37 @@ def categorize_op(name: str) -> str:
     return "Other"
 
 
+def profiler_time_us(event, names: tuple[str, ...]) -> float:
+    values = []
+    for name in names:
+        value = getattr(event, name, None)
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+            if value > 0:
+                return float(value)
+    return values[0] if values else 0.0
+
+
+def profiler_self_cuda_us(event) -> float:
+    # PyTorch versions differ here: recent profiler events use
+    # self_device_time_total/device_time_total, while older versions expose
+    # self_cuda_time_total/cuda_time_total. Prefer self time to avoid double
+    # counting nested aten::linear -> aten::matmul -> aten::mm stacks.
+    return profiler_time_us(event, (
+        "self_device_time_total",
+        "self_cuda_time_total",
+        "device_time_total",
+        "cuda_time_total",
+    ))
+
+
+def profiler_self_cpu_us(event) -> float:
+    return profiler_time_us(event, (
+        "self_cpu_time_total",
+        "cpu_time_total",
+    ))
+
+
 def summarize_profiler_categories(prof) -> list[dict]:
     categories = {}
     for event in prof.key_averages():
@@ -76,8 +107,8 @@ def summarize_profiler_categories(prof) -> list[dict]:
             "self_cpu_time_ms": 0.0,
             "calls": 0,
         })
-        entry["self_cuda_time_ms"] += getattr(event, "self_cuda_time_total", getattr(event, "cuda_time_total", 0.0)) / 1000.0
-        entry["self_cpu_time_ms"] += getattr(event, "self_cpu_time_total", getattr(event, "cpu_time_total", 0.0)) / 1000.0
+        entry["self_cuda_time_ms"] += profiler_self_cuda_us(event) / 1000.0
+        entry["self_cpu_time_ms"] += profiler_self_cpu_us(event) / 1000.0
         entry["calls"] += getattr(event, "count", 0)
     return sorted(categories.values(), key=lambda row: row["self_cuda_time_ms"], reverse=True)
 
@@ -215,6 +246,9 @@ def main():
         markdown_table(result["summary"]),
         "## Bottleneck Categories",
         markdown_rows(result["category_rows"], ["category", "self_cuda_time_ms", "self_cpu_time_ms", "calls"]),
+        "Profiler category times use self CUDA time when available to reduce nested operator double counting. "
+        "Profiler overhead and CUDA asynchronous execution mean these numbers should explain bottleneck shape, "
+        "not replace wall-clock E2E latency.",
         "## Top Ops",
         "```text\n" + result["op_table"] + "\n```",
     ])
