@@ -129,6 +129,10 @@ Measured on a single RTX 5090 with Qwen3-4B, prompt length 512, 4 prompts, 128 g
 | Decode step p95 | 45.6434 ms | 25.9239 ms | 1.761x lower |
 | Peak GPU memory | 27.4288 GB | 27.3754 GB | 1.002x lower |
 
+The table above uses the controlled `compare_upstream.py` A/B harness. A separate fork-only repeat3
+E2E run reaches 225.8 decode tokens/s and 4.44 ms average ITL, but that standalone run is reported
+for reproducibility and is not used to compute the upstream-vs-fork speedup.
+
 Prefix-cache workloads make KV-cache behavior visible instead of treating it as hidden engine state.
 Compared with a no-shared-prefix workload, a shared few-shot prefix reduces TTFT from 374.4 ms to
 65.3 ms and improves decode throughput from 115.9 to 168.8 tokens/s. This is the serving-system reason

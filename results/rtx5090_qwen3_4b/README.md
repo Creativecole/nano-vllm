@@ -28,6 +28,18 @@ serving metrics, and the derived kernel policy without changing the conservative
 | `upstream_vs_fork_qwen3_4b_5090.md` | Upstream nano-vLLM vs fork e2e comparison |
 | `prefix_cache_qwen3_4b_5090.md` | Prefix-cache workload benchmark |
 
+## Benchmark Result Sources
+
+| Category | Source | Use |
+|---|---|---|
+| Controlled A/B comparison | `upstream_vs_fork_qwen3_4b_5090.md` | Main upstream-vs-fork speedup claims |
+| Standalone fork-only E2E repeat3 | `e2e_qwen3_4b_5090_repeat3.md` | Latest fork-only reproducibility run: 225.8 decode tokens/s, 4.44 ms ITL, 2.3391 s elapsed |
+| Kernel policy snapshot | `KERNEL_POLICY_REPORT.md` | Backend/kernel decision summary; its E2E row is a policy-report snapshot and is not the main A/B speedup source |
+
+The controlled A/B table is the only source used for upstream-vs-fork speedup claims. The standalone
+repeat3 result is useful for reproducing current fork performance, while the policy report may contain
+an older E2E snapshot if it has not been regenerated.
+
 ## Upstream vs Fork E2E
 
 Measured with Qwen3-4B, prompt length 512, 4 prompts, 128 generated tokens, `--enforce-eager`,

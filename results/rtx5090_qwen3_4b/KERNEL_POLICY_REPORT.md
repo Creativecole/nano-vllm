@@ -8,6 +8,10 @@
 
 ## E2E Summary
 
+This E2E summary is a policy-report snapshot. For the latest standalone fork-only repeat3 E2E result,
+see `e2e_qwen3_4b_5090_repeat3.md`. For upstream-vs-fork speedup claims, see
+`upstream_vs_fork_qwen3_4b_5090.md`.
+
 | Metric | Value |
 | --- | --- |
 | model | ../models/Qwen3-4B |
@@ -120,4 +124,3 @@ Custom CUDA GEMM is treated as a research baseline. Rows below are cases where n
 ## Runtime Scope
 
 This policy is a report artifact only. It is not wired into nano-vLLM runtime dispatch, and the default serving path remains FlashAttention 2, model-dtype KV cache, and cuBLAS Linear.
-
