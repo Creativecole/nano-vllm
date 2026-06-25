@@ -121,10 +121,11 @@ Compared with a no-shared-prefix workload, a shared few-shot prefix reduces TTFT
 65.3 ms and improves decode throughput from 115.9 to 168.8 tokens/s. This is the serving-system reason
 to expose prefix hits, misses, hit rate, and block utilization in benchmark output.
 
-Profiler evidence for the same Qwen3-4B workload shows that decode time is dominated by BF16
-Linear/GEMM work. In a 64-step PyTorch profiler trace, `aten::mm` accounts for about 422 ms of CUDA
-time across 9,280 calls, while FlashAttention decode kernels account for about 27 ms combined. This is
-why the next serious kernel track is BF16 Tensor Core GEMM rather than a blind attention rewrite.
+Profiler evidence for the same Qwen3-4B workload shows that decode kernel self-time is dominated by
+BF16 Linear/GEMM work. In a 64-step PyTorch profiler trace, Linear/GEMM CUDA kernels account for
+421.8 ms of kernel self-time, while FlashAttention kernels account for 30.2 ms. These profiler numbers
+guide optimization targets rather than replacing wall-clock E2E latency. The next serious kernel track
+is BF16 Tensor Core GEMM rather than a blind attention rewrite.
 
 Key result files:
 

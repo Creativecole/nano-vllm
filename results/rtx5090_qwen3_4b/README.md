@@ -58,14 +58,14 @@ block utilization instead of treating KV cache as an invisible implementation de
 ## Profiler Evidence
 
 The PyTorch profiler run captures 64 scheduler steps: 1 prefill step and 63 decode steps. The trace
-shows that Qwen3-4B decode is dominated by BF16 Linear/GEMM work:
+shows that Qwen3-4B decode kernel self-time is dominated by BF16 Linear/GEMM work:
 
 | Profiler item | CUDA time | Calls | Interpretation |
 |---|---:|---:|---|
-| `aten::mm` / `aten::linear` | ~422 ms | 9,280 | Main decode bottleneck |
-| CUTLASS BF16 GEMM kernels | ~419 ms | 9,280 | cuBLAS/CUTLASS linear backend dominates |
-| FlashAttention decode kernels | ~27 ms | 4,536 | Attention is not the first bottleneck here |
-| Triton SiLU/RMSNorm/RoPE/store kernels | ~35 ms | 13,888 | Useful but smaller contributors |
+| Linear/GEMM CUDA kernels | 421.8 ms | 11,548 | Main decode kernel bottleneck |
+| FlashAttention kernels | 30.2 ms | 4,572 | Attention is much smaller than GEMM |
+| Triton SiLU/RMSNorm/RoPE/store kernels | 35.5 ms | 18,496 | Useful but smaller contributors |
+| KV-cache store kernel | 2.7 ms | 2,304 | KV store is not the current bottleneck |
 
 This motivates keeping cuBLAS Linear as the production default while using the CUDA GEMM worklog as
 the next research track: vectorized loads, register tiling, and BF16 Tensor Core MMA.
