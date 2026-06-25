@@ -38,20 +38,32 @@ This fork extends nano-vLLM in five areas:
 
 ## Architecture Overview
 
-```mermaid
-%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#f8fafc", "primaryTextColor": "#111827", "primaryBorderColor": "#64748b", "lineColor": "#475569", "secondaryColor": "#eef2ff", "tertiaryColor": "#f0fdfa"}}}%%
-flowchart TD
-    A["Prompts / Requests"] --> B["LLM.generate / LLMEngine.step"]
-    B --> C["Scheduler"]
-    C --> D["BlockManager / Prefix Cache"]
-    D --> E["ModelRunner"]
-    E --> F["Qwen3 Model"]
-    F --> G["FlashAttention / Triton Kernels / cuBLAS Linear"]
-    G --> H["Sampler"]
-    H --> I["Generated Tokens"]
-    C --> J["Prefill vs Decode Decision"]
-    E --> K["CUDA Graph Decode Path"]
-    D --> L["Paged KV Cache Blocks"]
+```text
+Prompts / Requests
+        |
+        v
+LLM.generate / LLMEngine.step
+        |
+        v
+Scheduler  ---------------------->  Prefill vs Decode Decision
+        |
+        v
+BlockManager / Prefix Cache  ---->  Paged KV Cache Blocks
+        |
+        v
+ModelRunner  -------------------->  CUDA Graph Decode Path
+        |
+        v
+Qwen3 Model
+        |
+        v
+FlashAttention / Triton Kernels / cuBLAS Linear
+        |
+        v
+Sampler
+        |
+        v
+Generated Tokens
 ```
 
 Runtime flow:
