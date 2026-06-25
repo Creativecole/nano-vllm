@@ -39,6 +39,7 @@ This fork extends nano-vLLM in five areas:
 ## Architecture Overview
 
 ```mermaid
+%%{init: {"theme": "base", "themeVariables": {"background": "#ffffff", "primaryColor": "#f8fafc", "primaryTextColor": "#111827", "primaryBorderColor": "#64748b", "lineColor": "#475569", "secondaryColor": "#eef2ff", "tertiaryColor": "#f0fdfa"}}}%%
 flowchart TD
     A["Prompts / Requests"] --> B["LLM.generate / LLMEngine.step"]
     B --> C["Scheduler"]
