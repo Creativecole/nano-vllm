@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+import re
 from time import perf_counter
 
 import torch
@@ -64,6 +65,27 @@ def categorize_component(name: str) -> str:
     return "Other"
 
 
+def categorize_cuda_kernel(name: str) -> str:
+    lowered = name.lower()
+    if any(token in lowered for token in ("flash_fwd", "flash_attn", "flash::", "splitkv", "_flash_attn")):
+        return "Attention"
+    if any(token in lowered for token in ("cutlass", "cublas", "gemm", "wmma", "mma")):
+        return "Linear/GEMM"
+    if "silu_and_mul" in lowered:
+        return "Activation"
+    if "rms_norm" in lowered or "layer_norm" in lowered:
+        return "Normalization"
+    if "rotary_embedding" in lowered or "rope" in lowered:
+        return "RoPE"
+    if "store_kvcache" in lowered or "kvcache" in lowered:
+        return "KV cache store"
+    if any(token in lowered for token in ("softmax", "argmax", "sample", "sampler")):
+        return "Sampling"
+    if any(token in lowered for token in ("cudalaunch", "culaunch", "cudafunc", "cudadevice")):
+        return "Kernel launch/runtime"
+    return "Other"
+
+
 def is_profiler_wrapper(name: str) -> bool:
     return "nano_vllm_engine_step" in name.lower()
 
@@ -83,6 +105,8 @@ def is_cuda_kernel_event(name: str, self_cuda_us: float) -> bool:
     if self_cuda_us <= 0 or is_operator_event(name) or is_profiler_wrapper(name):
         return False
     lowered = name.lower()
+    if lowered.startswith("flash_attn::"):
+        return False
     kernel_markers = (
         "kernel",
         "cutlass",
@@ -172,7 +196,7 @@ def summarize_cuda_kernel_categories(prof) -> list[dict]:
         self_cuda_us = profiler_self_cuda_us(event)
         if not is_cuda_kernel_event(event.key, self_cuda_us):
             continue
-        category = categorize_component(event.key)
+        category = categorize_cuda_kernel(event.key)
         entry = categories.setdefault(category, {
             "category": category,
             "self_cuda_time_ms": 0.0,
@@ -185,17 +209,40 @@ def summarize_cuda_kernel_categories(prof) -> list[dict]:
     return sorted(categories.values(), key=lambda row: row["self_cuda_time_ms"], reverse=True)
 
 
-def total_self_cuda_ms(prof) -> float:
-    return sum(profiler_self_cuda_us(event) for event in prof.key_averages()) / 1000.0
+def parse_time_to_ms(value: str, unit: str) -> float:
+    number = float(value)
+    unit = unit.lower()
+    if unit == "s":
+        return number * 1000.0
+    if unit == "ms":
+        return number
+    if unit == "us":
+        return number / 1000.0
+    return number
 
 
-def kernel_self_time_warning(kernel_rows: list[dict], self_cuda_total_ms: float) -> str:
+def extract_self_cuda_total_ms(op_table: str) -> float | None:
+    match = re.search(r"Self CUDA time total:\s*([0-9.]+)\s*([a-zA-Z]+)", op_table)
+    if not match:
+        return None
+    return parse_time_to_ms(match.group(1), match.group(2))
+
+
+def kernel_self_time_warning(kernel_rows: list[dict], self_cuda_total_ms: float | None) -> str:
     kernel_total = sum(row["self_cuda_time_ms"] for row in kernel_rows)
-    if self_cuda_total_ms and kernel_total > self_cuda_total_ms * 1.10:
+    if self_cuda_total_ms is None:
         return (
-            f"Warning: kernel category self-time sums to {kernel_total:.4f} ms, "
-            f"which is greater than the profiler self CUDA total {self_cuda_total_ms:.4f} ms. "
-            "Treat category totals as approximate."
+            f"Kernel category self-time sum: {kernel_total:.4f} ms. "
+            "Profiler self CUDA total was not found in the PyTorch table."
+        )
+    lower = self_cuda_total_ms * 0.90
+    upper = self_cuda_total_ms * 1.10
+    if kernel_total < lower or kernel_total > upper:
+        return (
+            f"Warning: kernel category sum differs from profiler self CUDA total by more than 10%; "
+            f"kernel category self-time sum: {kernel_total:.4f} ms. "
+            f"Profiler self CUDA total: {self_cuda_total_ms:.4f} ms. "
+            "Inspect unmatched profiler events."
         )
     return (
         f"Kernel category self-time sum: {kernel_total:.4f} ms. "
@@ -256,7 +303,7 @@ def run_profile(llm, prompts: list[list[int]], sampling_params, args):
     op_table = prof.key_averages().table(sort_by=sort_by, row_limit=args.row_limit)
     operator_rows = summarize_operator_attribution(prof)
     kernel_rows = summarize_cuda_kernel_categories(prof)
-    self_cuda_total_ms = total_self_cuda_ms(prof)
+    self_cuda_total_ms = extract_self_cuda_total_ms(op_table)
     return {
         "summary": {
             "model": args.model,
