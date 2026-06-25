@@ -41,7 +41,7 @@ def markdown_rows(rows: list[dict], columns: list[str]) -> str:
     return "\n".join(lines)
 
 
-def categorize_op(name: str) -> str:
+def categorize_component(name: str) -> str:
     lowered = name.lower()
     if "nano_vllm_engine_step" in lowered:
         return "Profiler wrapper"
@@ -59,9 +59,46 @@ def categorize_op(name: str) -> str:
         return "KV cache store"
     if any(token in lowered for token in ("argmax", "softmax", "sample", "sampler")):
         return "Sampling"
-    if "cuda" in lowered and "launch" in lowered:
-        return "Kernel launch"
+    if any(token in lowered for token in ("cudalaunch", "culaunch", "cudafunc", "cudadevice")):
+        return "Kernel launch/runtime"
     return "Other"
+
+
+def is_profiler_wrapper(name: str) -> bool:
+    return "nano_vllm_engine_step" in name.lower()
+
+
+def is_operator_event(name: str) -> bool:
+    lowered = name.lower()
+    if is_profiler_wrapper(name):
+        return False
+    if name.startswith("aten::"):
+        return True
+    if name in {"FlashAttnVarlenFunc"} or lowered.startswith("flash_attn::"):
+        return True
+    return False
+
+
+def is_cuda_kernel_event(name: str, self_cuda_us: float) -> bool:
+    if self_cuda_us <= 0 or is_operator_event(name) or is_profiler_wrapper(name):
+        return False
+    lowered = name.lower()
+    kernel_markers = (
+        "kernel",
+        "cutlass",
+        "cublas",
+        "flash_fwd",
+        "splitkv",
+        "silu_and_mul",
+        "rms_norm",
+        "rotary_embedding",
+        "store_kvcache",
+        "cudalaunch",
+        "culaunch",
+        "cudafunc",
+        "cudadevice",
+    )
+    return name.startswith("void ") or any(marker in lowered for marker in kernel_markers)
 
 
 def profiler_time_us(event, names: tuple[str, ...]) -> float:
@@ -95,22 +132,75 @@ def profiler_self_cpu_us(event) -> float:
     ))
 
 
-def summarize_profiler_categories(prof) -> list[dict]:
+def profiler_total_cuda_us(event) -> float:
+    return profiler_time_us(event, (
+        "device_time_total",
+        "cuda_time_total",
+        "self_device_time_total",
+        "self_cuda_time_total",
+    ))
+
+
+def profiler_total_cpu_us(event) -> float:
+    return profiler_time_us(event, (
+        "cpu_time_total",
+        "self_cpu_time_total",
+    ))
+
+
+def summarize_operator_attribution(prof) -> list[dict]:
     categories = {}
     for event in prof.key_averages():
-        category = categorize_op(event.key)
-        if category == "Profiler wrapper":
+        if not is_operator_event(event.key):
             continue
+        category = categorize_component(event.key)
+        entry = categories.setdefault(category, {
+            "category": category,
+            "cuda_total_ms": 0.0,
+            "cpu_total_ms": 0.0,
+            "calls": 0,
+        })
+        entry["cuda_total_ms"] += profiler_total_cuda_us(event) / 1000.0
+        entry["cpu_total_ms"] += profiler_total_cpu_us(event) / 1000.0
+        entry["calls"] += getattr(event, "count", 0)
+    return sorted(categories.values(), key=lambda row: row["cuda_total_ms"], reverse=True)
+
+
+def summarize_cuda_kernel_categories(prof) -> list[dict]:
+    categories = {}
+    for event in prof.key_averages():
+        self_cuda_us = profiler_self_cuda_us(event)
+        if not is_cuda_kernel_event(event.key, self_cuda_us):
+            continue
+        category = categorize_component(event.key)
         entry = categories.setdefault(category, {
             "category": category,
             "self_cuda_time_ms": 0.0,
             "self_cpu_time_ms": 0.0,
             "calls": 0,
         })
-        entry["self_cuda_time_ms"] += profiler_self_cuda_us(event) / 1000.0
+        entry["self_cuda_time_ms"] += self_cuda_us / 1000.0
         entry["self_cpu_time_ms"] += profiler_self_cpu_us(event) / 1000.0
         entry["calls"] += getattr(event, "count", 0)
     return sorted(categories.values(), key=lambda row: row["self_cuda_time_ms"], reverse=True)
+
+
+def total_self_cuda_ms(prof) -> float:
+    return sum(profiler_self_cuda_us(event) for event in prof.key_averages()) / 1000.0
+
+
+def kernel_self_time_warning(kernel_rows: list[dict], self_cuda_total_ms: float) -> str:
+    kernel_total = sum(row["self_cuda_time_ms"] for row in kernel_rows)
+    if self_cuda_total_ms and kernel_total > self_cuda_total_ms * 1.10:
+        return (
+            f"Warning: kernel category self-time sums to {kernel_total:.4f} ms, "
+            f"which is greater than the profiler self CUDA total {self_cuda_total_ms:.4f} ms. "
+            "Treat category totals as approximate."
+        )
+    return (
+        f"Kernel category self-time sum: {kernel_total:.4f} ms. "
+        f"Profiler self CUDA total: {self_cuda_total_ms:.4f} ms."
+    )
 
 
 def run_warmup(llm, prompts: list[list[int]], sampling_params, steps: int):
@@ -164,7 +254,9 @@ def run_profile(llm, prompts: list[list[int]], sampling_params, args):
 
     sort_by = "cuda_time_total" if torch.cuda.is_available() else "self_cpu_time_total"
     op_table = prof.key_averages().table(sort_by=sort_by, row_limit=args.row_limit)
-    category_rows = summarize_profiler_categories(prof)
+    operator_rows = summarize_operator_attribution(prof)
+    kernel_rows = summarize_cuda_kernel_categories(prof)
+    self_cuda_total_ms = total_self_cuda_ms(prof)
     return {
         "summary": {
             "model": args.model,
@@ -184,7 +276,9 @@ def run_profile(llm, prompts: list[list[int]], sampling_params, args):
             "with_stack": args.with_stack,
         },
         "op_table": op_table,
-        "category_rows": category_rows,
+        "operator_rows": operator_rows,
+        "kernel_rows": kernel_rows,
+        "kernel_warning": kernel_self_time_warning(kernel_rows, self_cuda_total_ms),
     }
 
 
@@ -244,9 +338,14 @@ def main():
     text = "\n\n".join([
         "# nano-vLLM E2E PyTorch Profiler",
         markdown_table(result["summary"]),
-        "## Bottleneck Categories",
-        markdown_rows(result["category_rows"], ["category", "self_cuda_time_ms", "self_cpu_time_ms", "calls"]),
-        "Profiler category times use self CUDA time when available to reduce nested operator double counting. "
+        "## Operator-Level CUDA Attribution",
+        markdown_rows(result["operator_rows"], ["category", "cuda_total_ms", "cpu_total_ms", "calls"]),
+        "Operator attribution is useful for understanding which model components cause CUDA work. "
+        "It may include child CUDA kernels, so do not sum it as wall-clock time.",
+        "## CUDA Kernel Self-Time Categories",
+        markdown_rows(result["kernel_rows"], ["category", "self_cuda_time_ms", "self_cpu_time_ms", "calls"]),
+        result["kernel_warning"],
+        "Kernel self-time categories are better for deciding low-level optimization targets. "
         "Profiler overhead and CUDA asynchronous execution mean these numbers should explain bottleneck shape, "
         "not replace wall-clock E2E latency.",
         "## Top Ops",
