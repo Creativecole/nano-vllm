@@ -134,9 +134,19 @@ E2E run reaches 225.8 decode tokens/s and 4.44 ms average ITL, but that standalo
 for reproducibility and is not used to compute the upstream-vs-fork speedup.
 
 Prefix-cache workloads make KV-cache behavior visible instead of treating it as hidden engine state.
+
+Fork-only prefix-cache workload results:
+
+| Workload | TTFT | Decode tokens/s | Prefix hit rate | Interpretation |
+|---|---:|---:|---:|---|
+| No shared prefix | 374.4 ms | 115.9 | 0.00 | Distinct prompts do not reuse full KV blocks |
+| Shared system prompt | 210.7 ms | 122.6 | 1.00 | Shared system blocks reduce prefill cost |
+| Shared few-shot prefix | 65.3 ms | 168.8 | 1.00 | Longer shared prefix gives the largest TTFT win |
+
 Compared with a no-shared-prefix workload, a shared few-shot prefix reduces TTFT from 374.4 ms to
 65.3 ms and improves decode throughput from 115.9 to 168.8 tokens/s. This is the serving-system reason
-to expose prefix hits, misses, hit rate, and block utilization in benchmark output.
+to expose prefix hits, misses, hit rate, and block utilization in benchmark output. This table is not
+used to compute the upstream-vs-fork speedup above.
 
 Profiler evidence for the same Qwen3-4B workload shows that decode kernel self-time is dominated by
 BF16 Linear/GEMM work. In a 64-step PyTorch profiler trace, Linear/GEMM CUDA kernels account for
