@@ -73,6 +73,7 @@ class LLMEngine:
             "activation_backend": config.activation_backend,
             "rope_backend": config.rope_backend,
             "linear_backend": config.linear_backend,
+            "attn_backend": config.attn_backend,
         })
         return metrics
 

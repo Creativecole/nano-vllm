@@ -131,6 +131,7 @@ class Config:
     activation_backend: str = "triton"
     rope_backend: str = "triton"
     linear_backend: str = "torch"
+    attn_backend: str = "flash_attn"
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -144,6 +145,7 @@ class Config:
         assert self.activation_backend in {"auto", "torch", "triton"}
         assert self.rope_backend in {"auto", "torch", "triton"}
         assert self.linear_backend in {"auto", "torch", "triton", "cuda"}
+        assert self.attn_backend in {"torch_sdpa", "flash_attn", "torch_paged", "triton_paged_decode"}
         self.hf_config = AutoConfig.from_pretrained(self.model)
         normalize_text_config_attrs(self.hf_config)
         max_position_embeddings = infer_max_position_embeddings(self.hf_config, self.max_model_len)

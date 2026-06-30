@@ -141,6 +141,7 @@ def run_once(args, run_index: int, LLM, SamplingParams):
             max_model_len=args.prompt_len + args.max_tokens,
             max_num_seqs=args.num_prompts,
             enforce_eager=args.enforce_eager,
+            attn_backend=args.attn_backend,
         )
         prompt = make_token_prompt(llm, args.prompt_len)
         prompts = [prompt[:] for _ in range(args.num_prompts)]
@@ -198,6 +199,7 @@ def run_once(args, run_index: int, LLM, SamplingParams):
             "activation_backend": metrics["activation_backend"],
             "rope_backend": metrics["rope_backend"],
             "linear_backend": metrics["linear_backend"],
+            "attn_backend": metrics["attn_backend"],
         }
     finally:
         if llm is not None:
@@ -252,6 +254,7 @@ def format_benchmark_output(rows: list[dict]) -> str:
         "model_dtype",
         "kv_cache_dtype",
         "linear_backend",
+        "attn_backend",
         "norm_backend",
         "activation_backend",
         "rope_backend",
@@ -281,6 +284,13 @@ def main():
     parser.add_argument("--output", type=str, default=None, help="Deprecated alias for --save-md.")
     parser.add_argument("--save-md", type=str, default=None)
     parser.add_argument("--save-json", type=str, default=None)
+    parser.add_argument(
+        "--attn-backend",
+        default="flash_attn",
+        choices=["flash_attn", "torch_sdpa", "torch_paged", "triton_paged_decode"],
+        help="E2E runtime currently supports the stable flash_attn path. "
+             "Use benchmarks/bench_attention_decode.py for torch_paged/triton_paged_decode backend tests.",
+    )
     args = parser.parse_args()
 
     assert args.repeat >= 1
@@ -288,6 +298,12 @@ def main():
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for bench_e2e.py")
+    if args.attn_backend != "flash_attn":
+        raise SystemExit(
+            "E2E generate path is not wired to custom attention backends yet. "
+            "Use benchmarks/bench_attention_decode.py for torch_paged/triton_paged_decode, "
+            "or keep --attn-backend flash_attn for stable generation."
+        )
 
     from nanovllm import LLM, SamplingParams
 
