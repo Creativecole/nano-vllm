@@ -4,7 +4,6 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from statistics import median
 from time import perf_counter
 
 import torch
@@ -20,6 +19,37 @@ from nanovllm.kernels.attention import (
     torch_paged_attention_decode,
 )
 from nanovllm.utils.shapes import load_qwen_attention_shapes
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def describe_case(args, shapes, batch_size: int, seq_len: int, block_size: int) -> str:
+    return (
+        f"backend={args.backend}, batch_size={batch_size}, seq_len={seq_len}, "
+        f"block_size={block_size}, dtype={args.dtype}"
+    )
+
+
+def verbose_case_details(args, shapes, q=None, k_cache=None, v_cache=None, block_tables=None, context_lens=None) -> None:
+    if not getattr(args, "verbose", False):
+        return
+    log(
+        "[verbose] "
+        f"num_q_heads={shapes.num_attention_heads}, "
+        f"num_kv_heads={shapes.num_key_value_heads}, "
+        f"head_dim={shapes.head_dim}, "
+        f"gqa_ratio={shapes.gqa_ratio}, "
+        f"dtype={args.dtype}"
+    )
+    if q is not None:
+        log(
+            "[verbose] "
+            f"q={tuple(q.shape)}, k_cache={tuple(k_cache.shape)}, "
+            f"v_cache={tuple(v_cache.shape)}, block_tables={tuple(block_tables.shape)}, "
+            f"context_lens={tuple(context_lens.shape)}"
+        )
 
 
 def parse_int_list(value: str) -> list[int]:
@@ -84,10 +114,13 @@ def make_decode_inputs(
 
 
 def run_case(args, shapes, batch_size: int, seq_len: int, block_size: int) -> dict:
+    case = describe_case(args, shapes, batch_size, seq_len, block_size)
+    log(f"[case] start {case}")
     dtype = dtype_from_name(args.dtype)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.backend == "triton_paged_decode" and device.type != "cuda":
         raise AttentionBackendError("triton_paged_decode requires CUDA")
+    log(f"[case] build inputs {case}")
     q, k_cache, v_cache, block_tables, context_lens = make_decode_inputs(
         batch_size=batch_size,
         seq_len=seq_len,
@@ -98,7 +131,9 @@ def run_case(args, shapes, batch_size: int, seq_len: int, block_size: int) -> di
         dtype=dtype,
         device=device,
     )
+    verbose_case_details(args, shapes, q, k_cache, v_cache, block_tables, context_lens)
     scale = shapes.head_dim ** -0.5
+    log(f"[case] correctness {case}")
     reference = torch_paged_attention_decode(q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -109,11 +144,13 @@ def run_case(args, shapes, batch_size: int, seq_len: int, block_size: int) -> di
     max_abs_error = float(diff.max().item())
     max_rel_error = float((diff / reference.float().abs().clamp_min(1e-6)).max().item())
 
+    log(f"[case] warmup {case} iterations={args.warmup}")
     for _ in range(args.warmup):
         _ = paged_attention_decode(args.backend, q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
     if device.type == "cuda":
         torch.cuda.synchronize()
 
+    log(f"[case] timing {case} iterations={args.repeat}")
     latencies = []
     for _ in range(args.repeat):
         if device.type == "cuda":
@@ -126,6 +163,7 @@ def run_case(args, shapes, batch_size: int, seq_len: int, block_size: int) -> di
 
     p50 = percentile(latencies, 50)
     p95 = percentile(latencies, 95)
+    log(f"[case] done {case} p50_ms={p50:.4f} p95_ms={p95:.4f} max_abs_error={max_abs_error:.4e}")
     return {
         "backend": args.backend,
         "batch_size": batch_size,
@@ -146,10 +184,12 @@ def run_case(args, shapes, batch_size: int, seq_len: int, block_size: int) -> di
 def write_outputs(rows: list[dict], args) -> None:
     if args.save_json:
         path = Path(args.save_json)
+        log(f"[save] writing JSON results to {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
     if args.save_md:
         path = Path(args.save_md)
+        log(f"[save] writing Markdown results to {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
         body = [
             "# Attention Decode Benchmark",
@@ -167,6 +207,8 @@ def write_outputs(rows: list[dict], args) -> None:
             "",
         ]
         path.write_text("\n".join(body), encoding="utf-8")
+    if not args.save_json and not args.save_md:
+        log("[save] no output path requested; results printed to stdout only")
 
 
 def main() -> None:
@@ -181,18 +223,29 @@ def main() -> None:
     parser.add_argument("--repeat", type=int, default=20)
     parser.add_argument("--save-md")
     parser.add_argument("--save-json")
+    parser.add_argument("--verbose", action="store_true", help="Print tensor shapes and model attention dimensions.")
     args = parser.parse_args()
 
+    log(f"[setup] loading model shapes from {args.model}")
     shapes = load_qwen_attention_shapes(args.model)
+    verbose_case_details(args, shapes)
     rows = []
     for block_size in parse_int_list(args.block_sizes):
         for batch_size in parse_int_list(args.batch_sizes):
             for seq_len in parse_int_list(args.seq_lens):
-                rows.append(run_case(args, shapes, batch_size, seq_len, block_size))
-    print(markdown_table(rows))
+                try:
+                    rows.append(run_case(args, shapes, batch_size, seq_len, block_size))
+                except Exception as exc:
+                    log(
+                        "[error] benchmark failed for "
+                        f"{describe_case(args, shapes, batch_size, seq_len, block_size)}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    raise
+    log("[summary] benchmark table")
+    print(markdown_table(rows), flush=True)
     write_outputs(rows, args)
 
 
 if __name__ == "__main__":
     main()
-
