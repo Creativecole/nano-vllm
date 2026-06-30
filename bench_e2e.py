@@ -287,9 +287,8 @@ def main():
     parser.add_argument(
         "--attn-backend",
         default="flash_attn",
-        choices=["flash_attn", "torch_sdpa", "torch_paged", "triton_paged_decode"],
-        help="E2E runtime currently supports the stable flash_attn path. "
-             "Use benchmarks/bench_attention_decode.py for torch_paged/triton_paged_decode backend tests.",
+        choices=["flash_attn", "torch_paged", "triton_paged_decode"],
+        help="Runtime decode attention backend. Custom paged backends currently require --enforce-eager.",
     )
     args = parser.parse_args()
 
@@ -298,12 +297,6 @@ def main():
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required for bench_e2e.py")
-    if args.attn_backend != "flash_attn":
-        raise SystemExit(
-            "E2E generate path is not wired to custom attention backends yet. "
-            "Use benchmarks/bench_attention_decode.py for torch_paged/triton_paged_decode, "
-            "or keep --attn-backend flash_attn for stable generation."
-        )
 
     from nanovllm import LLM, SamplingParams
 

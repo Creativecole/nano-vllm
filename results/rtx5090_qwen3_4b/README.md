@@ -30,8 +30,10 @@ directory.
 | `attention_decode.md` / `.json` | `benchmarks/bench_attention_decode.py` | Decode-only paged attention latency/correctness |
 | `attention_prefill.md` / `.json` | `benchmarks/bench_attention_prefill.py` | Torch SDPA vs FlashAttention prefill comparison |
 | `qwen3_attention_summary.md` / `.json` | `benchmarks/bench_qwen3_4b_attention.py` | Main Qwen3-4B attention backend summary |
-| `e2e_flash_attn_baseline.md` / `.json` | `bench_e2e.py` | Stable runtime baseline before custom backend integration |
-| `profile_flash_attn_baseline.md` / `.json` | `profile_e2e.py` | Runtime profiler baseline for comparison |
+| `e2e_flash_attn_baseline.md` / `.json` | `bench_e2e.py --attn-backend flash_attn` | Stable runtime baseline |
+| `e2e_triton_paged_decode.md` / `.json` | `bench_e2e.py --attn-backend triton_paged_decode --enforce-eager` | Experimental custom decode E2E run |
+| `profile_flash_attn_baseline.md` / `.json` | `profile_e2e.py --attn-backend flash_attn` | Runtime profiler baseline |
+| `profile_triton_paged_decode.md` / `.json` | `profile_e2e.py --attn-backend triton_paged_decode --enforce-eager` | Custom decode profiler evidence |
 
 Do not hand-edit performance numbers. Generate them from scripts on the RTX 5090 machine.
 
@@ -66,8 +68,30 @@ python benchmarks/bench_attention_prefill.py \
   --batch-sizes 1,4 \
   --save-md results/rtx5090_qwen3_4b/attention_prefill.md \
   --save-json results/rtx5090_qwen3_4b/attention_prefill.json
+
+python bench_e2e.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-new-tokens 128 \
+  --attn-backend triton_paged_decode \
+  --enforce-eager \
+  --save-md results/rtx5090_qwen3_4b/e2e_triton_paged_decode.md \
+  --save-json results/rtx5090_qwen3_4b/e2e_triton_paged_decode.json
+
+python profile_e2e.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-tokens 128 \
+  --attn-backend triton_paged_decode \
+  --enforce-eager \
+  --profile-steps 64 \
+  --profile-memory \
+  --record-shapes \
+  --trace-output results/rtx5090_qwen3_4b/profile_triton_paged_decode.json \
+  --summary-output results/rtx5090_qwen3_4b/profile_triton_paged_decode.md
 ```
 
-After the custom decode backend is wired into `ModelRunner`, add E2E and profiler runs that compare
-the stable FlashAttention path with the Triton paged decode path.
-
+`triton_paged_decode` is an explicit eager-mode runtime experiment. Keep `flash_attn` as the default
+runtime baseline until custom decode wins are validated by E2E and profiler artifacts.

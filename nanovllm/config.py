@@ -146,10 +146,19 @@ class Config:
         assert self.rope_backend in {"auto", "torch", "triton"}
         assert self.linear_backend in {"auto", "torch", "triton", "cuda"}
         assert self.attn_backend in {"torch_sdpa", "flash_attn", "torch_paged", "triton_paged_decode"}
+        if self.attn_backend == "torch_sdpa":
+            raise ValueError("attn_backend='torch_sdpa' is a prefill benchmark backend, not an e2e runtime backend")
+        if self.attn_backend in {"torch_paged", "triton_paged_decode"} and not self.enforce_eager:
+            raise ValueError(
+                f"attn_backend='{self.attn_backend}' currently requires enforce_eager=True; "
+                "CUDA Graph integration is intentionally left for a later step"
+            )
         self.hf_config = AutoConfig.from_pretrained(self.model)
         normalize_text_config_attrs(self.hf_config)
         max_position_embeddings = infer_max_position_embeddings(self.hf_config, self.max_model_len)
         self.hf_config.max_position_embeddings = max_position_embeddings
         dtype = infer_torch_dtype(self.hf_config)
         self.hf_config.dtype = dtype
+        self.hf_config.attn_backend = self.attn_backend
+        self.hf_config.kvcache_block_size = self.kvcache_block_size
         self.max_model_len = min(self.max_model_len, max_position_embeddings)

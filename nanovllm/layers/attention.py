@@ -5,6 +5,8 @@ import triton.language as tl
 from inspect import signature
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from nanovllm.kernels.attention.torch_paged_attention import torch_paged_attention_decode
+from nanovllm.kernels.attention.triton_paged_decode import triton_paged_attention_decode
 from nanovllm.utils.context import get_context
 
 
@@ -137,6 +139,8 @@ class Attention(nn.Module):
         scale,
         num_kv_heads,
         layer_id: int = 0,
+        attn_backend: str = "flash_attn",
+        block_size: int = 256,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -144,6 +148,8 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.layer_id = layer_id
+        self.attn_backend = attn_backend
+        self.block_size = block_size
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
@@ -159,7 +165,30 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            o = _call_flash_attn_with_kvcache(
-                q, k_cache, v_cache, context, self.scale,
-            )
+            if self.attn_backend == "flash_attn":
+                o = _call_flash_attn_with_kvcache(
+                    q, k_cache, v_cache, context, self.scale,
+                )
+            elif self.attn_backend == "triton_paged_decode":
+                o = triton_paged_attention_decode(
+                    q,
+                    k_cache,
+                    v_cache,
+                    context.block_tables,
+                    context.context_lens,
+                    scale=self.scale,
+                    block_size=self.block_size,
+                )
+            elif self.attn_backend == "torch_paged":
+                o = torch_paged_attention_decode(
+                    q,
+                    k_cache,
+                    v_cache,
+                    context.block_tables,
+                    context.context_lens,
+                    scale=self.scale,
+                    block_size=self.block_size,
+                )
+            else:
+                raise RuntimeError(f"Unsupported decode attention backend: {self.attn_backend}")
         return o

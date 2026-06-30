@@ -22,6 +22,8 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        if rank == 0:
+            print(f"[nanovllm] attention backend: {config.attn_backend}", flush=True)
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)

@@ -25,6 +25,8 @@ class Qwen3Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: dict | None = None,
         layer_id: int = 0,
+        attn_backend: str = "flash_attn",
+        block_size: int = 256,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -66,6 +68,8 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
             layer_id=layer_id,
+            attn_backend=attn_backend,
+            block_size=block_size,
         )
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -138,6 +142,8 @@ class Qwen3DecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
             layer_id=layer_id,
+            attn_backend=getattr(config, "attn_backend", "flash_attn"),
+            block_size=getattr(config, "kvcache_block_size", 256),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,

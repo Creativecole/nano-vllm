@@ -12,9 +12,9 @@ This fork is being shaped into a focused attention-kernel project for Qwen3-4B o
 track is decode-only Triton PagedAttention with GQA and paged KV-cache block tables, benchmarked
 against Torch reference paths and FlashAttention where available.
 
-The stable generation path still uses nano-vLLM's existing FlashAttention integration. The custom
-Triton PagedAttention backend is currently exposed as a standalone backend/benchmark path first, so
-correctness and latency can be evaluated before it is wired into `ModelRunner` decode.
+The default generation path still uses nano-vLLM's existing FlashAttention integration. The custom
+Triton PagedAttention backend is available as an explicit eager-mode decode backend, so correctness,
+latency, profiling, and E2E behavior can be evaluated without changing the stable default path.
 
 ## Project Scope
 
@@ -25,7 +25,7 @@ correctness and latency can be evaluated before it is wired into `ModelRunner` d
 | GQA | Query-head to KV-head mapping tested and used by Torch/Triton decode paths |
 | Decode backend | `torch_paged` reference and `triton_paged_decode` custom kernel |
 | Prefill benchmark | Torch SDPA and FlashAttention comparison; Triton flash-style prefill remains TODO |
-| E2E generation | Stable `flash_attn` path preserved; custom decode backend integration is TODO |
+| E2E generation | Stable `flash_attn` path preserved; `triton_paged_decode` can be enabled explicitly in eager mode |
 
 ## Attention Backend Model
 
@@ -60,6 +60,9 @@ Supported backend names:
 The Triton decode kernel currently targets single-token decode, GQA, paged KV block tables,
 `fp16`/`bf16`, and `head_dim=128`. It uses online softmax and does not materialize the full attention
 score matrix.
+
+Runtime note: `torch_paged` and `triton_paged_decode` currently require `--enforce-eager`. CUDA Graph
+capture for custom decode backends is intentionally left as a later integration step.
 
 ## Main Commands
 
@@ -106,6 +109,20 @@ python benchmarks/bench_attention_prefill.py \
 
 No benchmark numbers are claimed until the scripts are run on the target RTX 5090 environment.
 
+End-to-end Triton paged decode experiment:
+
+```bash
+python bench_e2e.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-new-tokens 128 \
+  --attn-backend triton_paged_decode \
+  --enforce-eager \
+  --save-md results/rtx5090_qwen3_4b/e2e_triton_paged_decode.md \
+  --save-json results/rtx5090_qwen3_4b/e2e_triton_paged_decode.json
+```
+
 ## Profiling Direction
 
 The next profiling target is the decode attention path itself:
@@ -118,7 +135,7 @@ The next profiling target is the decode attention path itself:
 
 The goal is to compare `torch_paged`, `triton_paged_decode`, and the stable FlashAttention runtime
 path on the same Qwen3-4B shapes, then use profiler evidence to decide whether the custom backend is
-worth wiring into `ModelRunner`.
+worth further optimizing and extending to CUDA Graph replay.
 
 ## Installation
 
@@ -212,6 +229,22 @@ python bench_e2e.py \
   --save-json results/rtx5090_qwen3_4b/e2e_qwen3_4b_5090_repeat3.json
 ```
 
+Run end-to-end generation benchmark with Triton paged decode enabled:
+
+```bash
+python bench_e2e.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-new-tokens 128 \
+  --attn-backend triton_paged_decode \
+  --enforce-eager \
+  --warmup 1 \
+  --repeat 3 \
+  --save-md results/rtx5090_qwen3_4b/e2e_triton_paged_decode_repeat3.md \
+  --save-json results/rtx5090_qwen3_4b/e2e_triton_paged_decode_repeat3.json
+```
+
 Capture a PyTorch profiler trace:
 
 ```bash
@@ -220,6 +253,7 @@ python profile_e2e.py \
   --prompt-len 512 \
   --num-prompts 4 \
   --max-tokens 128 \
+  --attn-backend triton_paged_decode \
   --enforce-eager \
   --profile-steps 64 \
   --profile-memory \
@@ -235,7 +269,7 @@ python profile_e2e.py \
 | `benchmarks/bench_attention_decode.py` | Decode-only paged attention backend benchmark |
 | `benchmarks/bench_attention_prefill.py` | Torch SDPA / FlashAttention prefill benchmark |
 | `benchmarks/bench_qwen3_4b_attention.py` | Main Qwen3-4B attention backend summary |
-| `bench_e2e.py` | Stable FlashAttention E2E baseline for later backend integration |
+| `bench_e2e.py` | E2E baseline and explicit eager custom decode backend runs |
 | `profile_e2e.py` | PyTorch profiler trace and top-op summary for runtime bottlenecks |
 
 ## Star History

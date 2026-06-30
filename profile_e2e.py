@@ -308,6 +308,7 @@ def run_profile(llm, prompts: list[list[int]], sampling_params, args):
         "summary": {
             "model": args.model,
             "gpu": torch.cuda.get_device_name(),
+            "attn_backend": args.attn_backend,
             "prompt_len": args.prompt_len,
             "num_prompts": args.num_prompts,
             "max_tokens": args.max_tokens,
@@ -337,6 +338,12 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument(
+        "--attn-backend",
+        default="flash_attn",
+        choices=["flash_attn", "torch_paged", "triton_paged_decode"],
+        help="Runtime attention backend. Custom paged backends currently require --enforce-eager.",
+    )
     parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--profile-steps", type=int, default=64)
     parser.add_argument("--row-limit", type=int, default=30)
@@ -362,6 +369,7 @@ def main():
             max_model_len=args.prompt_len + args.max_tokens,
             max_num_seqs=args.num_prompts,
             enforce_eager=args.enforce_eager,
+            attn_backend=args.attn_backend,
         )
         prompt = make_token_prompt(llm, args.prompt_len)
         prompts = [prompt[:] for _ in range(args.num_prompts)]
@@ -375,6 +383,7 @@ def main():
                 max_model_len=args.prompt_len + args.max_tokens,
                 max_num_seqs=args.num_prompts,
                 enforce_eager=args.enforce_eager,
+                attn_backend=args.attn_backend,
             )
 
         result = run_profile(llm, prompts, sampling_params, args)

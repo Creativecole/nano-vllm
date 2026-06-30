@@ -1,7 +1,7 @@
 # Attention Backend
 
-This fork exposes attention backends as standalone benchmarkable paths before changing the default
-generation runtime.
+This fork exposes attention backends as standalone benchmarkable paths and as explicit eager-mode
+runtime choices. The default generation runtime remains FlashAttention.
 
 ## Backends
 
@@ -12,11 +12,25 @@ generation runtime.
 | `torch_paged` | decode | correctness reference over paged KV cache |
 | `triton_paged_decode` | decode | custom decode-only Triton PagedAttention kernel |
 
-The E2E `LLM.generate` path still uses `flash_attn`. Custom decode backends should first pass
-correctness and standalone latency benchmarks, then be wired into `ModelRunner` with CUDA Graph
-handling.
+The E2E `LLM.generate` path defaults to `flash_attn`. Custom decode backends can be selected with
+`attn_backend="torch_paged"` or `attn_backend="triton_paged_decode"` when `enforce_eager=True`.
+CUDA Graph capture for custom decode backends is not enabled yet.
 
 ## Current API
+
+Runtime selection:
+
+```python
+from nanovllm import LLM
+
+llm = LLM(
+    "../models/Qwen3-4B",
+    enforce_eager=True,
+    attn_backend="triton_paged_decode",
+)
+```
+
+Standalone backend selection:
 
 ```python
 from nanovllm.backends import paged_attention_decode
@@ -39,5 +53,4 @@ out = paged_attention_decode(
 - `triton_paged_decode` is decode-only.
 - `head_dim=128` is the first supported target.
 - Prefill currently compares Torch SDPA and FlashAttention; a Triton flash-style prefill kernel is TODO.
-- E2E custom backend integration is not enabled by default.
-
+- E2E custom backend integration is explicit and eager-only; CUDA Graph support remains TODO.
