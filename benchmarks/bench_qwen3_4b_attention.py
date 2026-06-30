@@ -17,7 +17,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Qwen3 attention backend summary benchmark.")
     parser.add_argument("--model", default="Qwen/Qwen3-4B")
     parser.add_argument("--dtype", default="bf16")
-    parser.add_argument("--attn-backends", default="torch_paged,triton_paged_decode")
+    parser.add_argument("--attn-backends", default="torch_paged,triton_paged_decode,triton_paged_decode_v2")
     parser.add_argument("--seq-lens", default="1024,4096,8192")
     parser.add_argument("--batch-sizes", default="1,4,8")
     parser.add_argument("--block-size", type=int, default=16)

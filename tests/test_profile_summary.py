@@ -59,11 +59,13 @@ def test_attention_kernel_names_are_classified_before_other():
         FakeEvent("void flash::flash_fwd_splitkv_kernel<traits>", 1, self_device_time_total=20_000.0),
         FakeEvent("void flash::flash_fwd_splitkv_combine_kernel<traits>", 1, self_device_time_total=6_000.0),
         FakeEvent("void flash::flash_fwd_kernel<traits>", 1, self_device_time_total=2_000.0),
+        FakeEvent("_triton_paged_decode_v2_kernel", 2, self_device_time_total=4_000.0),
     ])
 
     rows = {row["category"]: row for row in summarize_cuda_kernel_categories(prof)}
 
-    assert rows["Attention"]["self_cuda_time_ms"] == 28.0
+    assert rows["Attention"]["self_cuda_time_ms"] == 32.0
+    assert rows["Attention"]["avg_self_cuda_us"] == 6400.0
     assert "Other" not in rows
 
 

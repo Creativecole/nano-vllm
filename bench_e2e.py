@@ -287,7 +287,7 @@ def main():
     parser.add_argument(
         "--attn-backend",
         default="flash_attn",
-        choices=["flash_attn", "torch_paged", "triton_paged_decode"],
+        choices=["flash_attn", "torch_paged", "triton_paged_decode", "triton_paged_decode_v2"],
         help="Runtime decode attention backend. Custom paged backends currently require --enforce-eager.",
     )
     args = parser.parse_args()

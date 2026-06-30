@@ -56,6 +56,10 @@ def parse_int_list(value: str) -> list[int]:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
+def parse_str_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def dtype_from_name(name: str) -> torch.dtype:
     aliases = {
         "fp16": torch.float16,
@@ -76,6 +80,8 @@ def percentile(values: list[float], pct: float) -> float:
 
 
 def format_value(value):
+    if value is None:
+        return "skipped"
     if isinstance(value, float):
         return f"{value:.4f}"
     return str(value)
@@ -118,8 +124,8 @@ def run_case(args, shapes, batch_size: int, seq_len: int, block_size: int) -> di
     log(f"[case] start {case}")
     dtype = dtype_from_name(args.dtype)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.backend == "triton_paged_decode" and device.type != "cuda":
-        raise AttentionBackendError("triton_paged_decode requires CUDA")
+    if args.backend.startswith("triton_paged_decode") and device.type != "cuda":
+        raise AttentionBackendError(f"{args.backend} requires CUDA")
     log(f"[case] build inputs {case}")
     q, k_cache, v_cache, block_tables, context_lens = make_decode_inputs(
         batch_size=batch_size,
@@ -137,12 +143,34 @@ def run_case(args, shapes, batch_size: int, seq_len: int, block_size: int) -> di
     reference = torch_paged_attention_decode(q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
     if device.type == "cuda":
         torch.cuda.synchronize()
-    output = paged_attention_decode(args.backend, q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
+    if args.backend == "torch_paged":
+        output = reference
+    else:
+        output = paged_attention_decode(args.backend, q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
     if device.type == "cuda":
         torch.cuda.synchronize()
     diff = (output.float() - reference.float()).abs()
     max_abs_error = float(diff.max().item())
     max_rel_error = float((diff / reference.float().abs().clamp_min(1e-6)).max().item())
+    skip_timing = args.backend == "torch_paged" and getattr(args, "skip_reference_timing", False)
+    if skip_timing:
+        log(f"[case] timing skipped for reference backend {case}")
+        return {
+            "backend": args.backend,
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "block_size": block_size,
+            "dtype": args.dtype,
+            "num_q_heads": shapes.num_attention_heads,
+            "num_kv_heads": shapes.num_key_value_heads,
+            "head_dim": shapes.head_dim,
+            "p50_latency_ms": None,
+            "p95_latency_ms": None,
+            "tokens_per_s": None,
+            "max_abs_error": max_abs_error,
+            "max_rel_error": max_rel_error,
+            "note": "reference timing skipped",
+        }
 
     log(f"[case] warmup {case} iterations={args.warmup}")
     for _ in range(args.warmup):
@@ -224,24 +252,34 @@ def main() -> None:
     parser.add_argument("--save-md")
     parser.add_argument("--save-json")
     parser.add_argument("--verbose", action="store_true", help="Print tensor shapes and model attention dimensions.")
+    parser.add_argument(
+        "--skip-reference-timing",
+        action="store_true",
+        help="Run correctness for torch_paged but skip its warmup/timing loop.",
+    )
     args = parser.parse_args()
 
     log(f"[setup] loading model shapes from {args.model}")
     shapes = load_qwen_attention_shapes(args.model)
     verbose_case_details(args, shapes)
     rows = []
-    for block_size in parse_int_list(args.block_sizes):
-        for batch_size in parse_int_list(args.batch_sizes):
-            for seq_len in parse_int_list(args.seq_lens):
-                try:
-                    rows.append(run_case(args, shapes, batch_size, seq_len, block_size))
-                except Exception as exc:
-                    log(
-                        "[error] benchmark failed for "
-                        f"{describe_case(args, shapes, batch_size, seq_len, block_size)}: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    raise
+    for backend in parse_str_list(args.backend):
+        log(f"[backend] start backend={backend}")
+        case_args = argparse.Namespace(**vars(args))
+        case_args.backend = backend
+        for block_size in parse_int_list(args.block_sizes):
+            for batch_size in parse_int_list(args.batch_sizes):
+                for seq_len in parse_int_list(args.seq_lens):
+                    try:
+                        rows.append(run_case(case_args, shapes, batch_size, seq_len, block_size))
+                    except Exception as exc:
+                        log(
+                            "[error] benchmark failed for "
+                            f"{describe_case(case_args, shapes, batch_size, seq_len, block_size)}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        raise
+        log(f"[backend] done backend={backend}")
     log("[summary] benchmark table")
     print(markdown_table(rows), flush=True)
     write_outputs(rows, args)

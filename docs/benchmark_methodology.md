@@ -30,5 +30,5 @@ present and measured.
 - Keep correctness error next to latency numbers.
 - Treat `torch_paged` as the reference path for decode.
 - Treat E2E `flash_attn` generation as the stable default runtime.
-- Treat E2E `triton_paged_decode` generation as an explicit eager-mode experiment until CUDA Graph
+- Treat E2E Triton paged decode generation as an explicit eager-mode experiment until CUDA Graph
   support and broader workload validation are complete.

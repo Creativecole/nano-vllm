@@ -11,6 +11,7 @@ ATTENTION_BACKENDS = {
     "flash_attn",
     "torch_paged",
     "triton_paged_decode",
+    "triton_paged_decode_v2",
 }
 
 
@@ -28,13 +29,13 @@ def require_backend(name: str) -> None:
             import flash_attn  # noqa: F401
         except Exception as exc:  # pragma: no cover - depends on optional CUDA wheel
             raise AttentionBackendError("flash_attn backend requested, but flash-attn is not importable") from exc
-    if name == "triton_paged_decode":
+    if name in {"triton_paged_decode", "triton_paged_decode_v2"}:
         try:
             import triton  # noqa: F401
         except Exception as exc:  # pragma: no cover
-            raise AttentionBackendError("triton_paged_decode backend requested, but Triton is not importable") from exc
+            raise AttentionBackendError(f"{name} backend requested, but Triton is not importable") from exc
         if not torch.cuda.is_available():
-            raise AttentionBackendError("triton_paged_decode backend requires CUDA")
+            raise AttentionBackendError(f"{name} backend requires CUDA")
 
 
 def paged_attention_decode(
@@ -54,9 +55,13 @@ def paged_attention_decode(
         from nanovllm.kernels.attention.triton_paged_decode import triton_paged_attention_decode
 
         return triton_paged_attention_decode(q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
+    if backend == "triton_paged_decode_v2":
+        from nanovllm.kernels.attention.triton_paged_decode_v2 import triton_paged_attention_decode_v2
+
+        return triton_paged_attention_decode_v2(q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
     raise AttentionBackendError(
         f"Backend '{backend}' is not a paged decode backend. "
-        "Use 'torch_paged' as the reference path or 'triton_paged_decode' for the custom kernel."
+        "Use 'torch_paged' as the reference path or a Triton paged decode backend for the custom kernel."
     )
 
 

@@ -6,7 +6,8 @@
 
 This fork turns nano-vLLM into a focused Qwen3-4B attention-backend project for RTX 5090. It keeps
 the original FlashAttention runtime path as the default, and adds an explicit eager-mode
-`triton_paged_decode` backend for single-token decode with GQA and paged KV-cache block tables.
+`triton_paged_decode` / `triton_paged_decode_v2` backends for single-token decode with GQA and
+paged KV-cache block tables.
 
 The project is built around one practical workflow:
 
@@ -20,9 +21,9 @@ Qwen3-4B shapes -> paged KV layout -> Torch reference -> Triton decode backend
 | Area | Added in this fork |
 |---|---|
 | Qwen3-4B shapes | Reads `hidden_size`, Q heads, KV heads, head dim, GQA ratio, and attention shapes from HF config |
-| Paged decode attention | `torch_paged` reference and `triton_paged_decode` backend over block tables |
+| Paged decode attention | `torch_paged` reference, `triton_paged_decode` v1, and `triton_paged_decode_v2` over block tables |
 | GQA support | Maps query heads to KV heads with `kv_head = q_head // GQA_ratio` |
-| E2E backend switch | `bench_e2e.py --attn-backend flash_attn|torch_paged|triton_paged_decode` |
+| E2E backend switch | `bench_e2e.py --attn-backend flash_attn|torch_paged|triton_paged_decode|triton_paged_decode_v2` |
 | Profiling | `profile_e2e.py` reports operator attribution and CUDA kernel self-time categories |
 | Validation | Tests for GQA mapping, paged KV layout, Qwen3 shapes, attention correctness, and KV store |
 
@@ -32,12 +33,13 @@ Qwen3-4B shapes -> paged KV layout -> Torch reference -> Triton decode backend
 |---|---|
 | `flash_attn` | Default nano-vLLM runtime path |
 | `torch_paged` | Correctness reference for paged decode attention |
-| `triton_paged_decode` | Custom decode-only Triton PagedAttention backend |
+| `triton_paged_decode` | Custom decode-only Triton PagedAttention v1 backend |
+| `triton_paged_decode_v2` | GQA-grouped Triton PagedAttention v2 backend |
 | `torch_sdpa` | Prefill benchmark reference |
 
-`triton_paged_decode` currently targets BF16/FP16 decode attention with `head_dim=128`, GQA, online
-softmax, and paged KV block tables. Runtime use is explicit and eager-only:
-`--attn-backend triton_paged_decode --enforce-eager`.
+The Triton paged decode backends currently target BF16/FP16 decode attention with `head_dim=128`,
+GQA, online softmax, and paged KV block tables. Runtime use is explicit and eager-only:
+`--attn-backend triton_paged_decode_v2 --enforce-eager`.
 
 ## RTX 5090 Results
 
@@ -117,7 +119,7 @@ llm = LLM(
     "../models/Qwen3-4B",
     enforce_eager=True,
     tensor_parallel_size=1,
-    attn_backend="triton_paged_decode",
+    attn_backend="triton_paged_decode_v2",
 )
 ```
 
@@ -135,12 +137,44 @@ Run the main attention backend benchmark:
 python benchmarks/bench_qwen3_4b_attention.py \
   --model ../models/Qwen3-4B \
   --dtype bf16 \
-  --attn-backends torch_paged,triton_paged_decode \
+  --attn-backends torch_paged,triton_paged_decode,triton_paged_decode_v2 \
   --seq-lens 1024,4096,8192 \
   --batch-sizes 1,4,8 \
   --block-size 16 \
   --save-md results/rtx5090_qwen3_4b/qwen3_attention_summary.md \
   --save-json results/rtx5090_qwen3_4b/qwen3_attention_summary.json
+```
+
+Run a small correctness spot check with the `torch_paged` reference:
+
+```bash
+python benchmarks/bench_triton_paged_decode_v2.py \
+  --model ../models/Qwen3-4B \
+  --dtype bf16 \
+  --backends torch_paged,triton_paged_decode,triton_paged_decode_v2 \
+  --seq-lens 1024,4096 \
+  --batch-sizes 1,4 \
+  --block-sizes 16 \
+  --warmup 1 \
+  --repeat 3 \
+  --save-md results/rtx5090_qwen3_4b/v2_correctness_spotcheck.md \
+  --save-json results/rtx5090_qwen3_4b/v2_correctness_spotcheck.json
+```
+
+Run the v1/v2 Triton performance sweep without timing the slow reference path:
+
+```bash
+python benchmarks/bench_triton_paged_decode_v2.py \
+  --model ../models/Qwen3-4B \
+  --dtype bf16 \
+  --backends triton_paged_decode,triton_paged_decode_v2 \
+  --seq-lens 1024,4096,8192,16384 \
+  --batch-sizes 1,4,8 \
+  --block-sizes 16,32,64,128,256 \
+  --warmup 5 \
+  --repeat 20 \
+  --save-md results/rtx5090_qwen3_4b/triton_paged_decode_v2.md \
+  --save-json results/rtx5090_qwen3_4b/triton_paged_decode_v2.json
 ```
 
 Run E2E benchmarks:
@@ -169,6 +203,18 @@ python bench_e2e.py \
   --repeat 3 \
   --save-md results/rtx5090_qwen3_4b/e2e_triton_paged_decode_repeat3.md \
   --save-json results/rtx5090_qwen3_4b/e2e_triton_paged_decode_repeat3.json
+
+python bench_e2e.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-new-tokens 128 \
+  --attn-backend triton_paged_decode_v2 \
+  --enforce-eager \
+  --warmup 1 \
+  --repeat 3 \
+  --save-md results/rtx5090_qwen3_4b/e2e_triton_paged_decode_v2_repeat3.md \
+  --save-json results/rtx5090_qwen3_4b/e2e_triton_paged_decode_v2_repeat3.json
 ```
 
 Capture a profiler trace:
@@ -179,13 +225,13 @@ python profile_e2e.py \
   --prompt-len 512 \
   --num-prompts 4 \
   --max-tokens 64 \
-  --attn-backend triton_paged_decode \
+  --attn-backend triton_paged_decode_v2 \
   --enforce-eager \
   --profile-steps 64 \
   --profile-memory \
   --record-shapes \
-  --trace-output results/rtx5090_qwen3_4b/profile_triton_paged_decode.json \
-  --summary-output results/rtx5090_qwen3_4b/profile_triton_paged_decode.md
+  --trace-output results/rtx5090_qwen3_4b/profile_triton_paged_decode_v2.json \
+  --summary-output results/rtx5090_qwen3_4b/profile_triton_paged_decode_v2.md
 ```
 
 ## Notes
@@ -193,3 +239,4 @@ python profile_e2e.py \
 - This is a fork of [GeeeekExplorer/nano-vllm](https://github.com/GeeeekExplorer/nano-vllm).
 - The default `LLM.generate` path remains FlashAttention unless `attn_backend` is explicitly set.
 - Benchmark numbers in this README come from generated result files in `results/rtx5090_qwen3_4b`.
+- v2 benchmark/profiler results should be generated before claiming v1 -> v2 speedup.

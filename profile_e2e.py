@@ -67,7 +67,15 @@ def categorize_component(name: str) -> str:
 
 def categorize_cuda_kernel(name: str) -> str:
     lowered = name.lower()
-    if any(token in lowered for token in ("flash_fwd", "flash_attn", "flash::", "splitkv", "_flash_attn")):
+    if any(token in lowered for token in (
+        "flash_fwd",
+        "flash_attn",
+        "flash::",
+        "splitkv",
+        "_flash_attn",
+        "triton_paged_decode",
+        "paged_decode",
+    )):
         return "Attention"
     if any(token in lowered for token in ("cutlass", "cublas", "gemm", "wmma", "mma")):
         return "Linear/GEMM"
@@ -206,7 +214,58 @@ def summarize_cuda_kernel_categories(prof) -> list[dict]:
         entry["self_cuda_time_ms"] += self_cuda_us / 1000.0
         entry["self_cpu_time_ms"] += profiler_self_cpu_us(event) / 1000.0
         entry["calls"] += getattr(event, "count", 0)
-    return sorted(categories.values(), key=lambda row: row["self_cuda_time_ms"], reverse=True)
+    rows = sorted(categories.values(), key=lambda row: row["self_cuda_time_ms"], reverse=True)
+    for row in rows:
+        row["avg_self_cuda_us"] = row["self_cuda_time_ms"] * 1000.0 / row["calls"] if row["calls"] else 0.0
+    return rows
+
+
+def summarize_index_gather_ops(prof) -> list[dict]:
+    rows = []
+    for event in prof.key_averages():
+        lowered = event.key.lower()
+        if not any(token in lowered for token in ("aten::index", "gather", "index_select")):
+            continue
+        calls = getattr(event, "count", 0)
+        self_cuda_ms = profiler_self_cuda_us(event) / 1000.0
+        cpu_total_ms = profiler_total_cpu_us(event) / 1000.0
+        rows.append({
+            "name": event.key,
+            "self_cuda_time_ms": self_cuda_ms,
+            "cpu_total_ms": cpu_total_ms,
+            "calls": calls,
+            "avg_self_cuda_us": self_cuda_ms * 1000.0 / calls if calls else 0.0,
+        })
+    return sorted(rows, key=lambda row: row["self_cuda_time_ms"], reverse=True)[:10]
+
+
+def summarize_attention_kernel_events(prof) -> list[dict]:
+    rows = []
+    for event in prof.key_averages():
+        self_cuda_us = profiler_self_cuda_us(event)
+        if self_cuda_us <= 0:
+            continue
+        lowered = event.key.lower()
+        if not any(token in lowered for token in (
+            "triton_paged_decode",
+            "paged_decode",
+            "flash_fwd",
+            "flash_attn",
+            "splitkv",
+            "_flash_attn",
+        )):
+            continue
+        if is_operator_event(event.key) or is_profiler_wrapper(event.key):
+            continue
+        calls = getattr(event, "count", 0)
+        self_cuda_ms = self_cuda_us / 1000.0
+        rows.append({
+            "name": event.key,
+            "self_cuda_time_ms": self_cuda_ms,
+            "calls": calls,
+            "avg_self_cuda_us": self_cuda_ms * 1000.0 / calls if calls else 0.0,
+        })
+    return sorted(rows, key=lambda row: row["self_cuda_time_ms"], reverse=True)[:10]
 
 
 def parse_time_to_ms(value: str, unit: str) -> float:
@@ -303,6 +362,8 @@ def run_profile(llm, prompts: list[list[int]], sampling_params, args):
     op_table = prof.key_averages().table(sort_by=sort_by, row_limit=args.row_limit)
     operator_rows = summarize_operator_attribution(prof)
     kernel_rows = summarize_cuda_kernel_categories(prof)
+    index_gather_rows = summarize_index_gather_ops(prof)
+    attention_kernel_rows = summarize_attention_kernel_events(prof)
     self_cuda_total_ms = extract_self_cuda_total_ms(op_table)
     return {
         "summary": {
@@ -326,6 +387,8 @@ def run_profile(llm, prompts: list[list[int]], sampling_params, args):
         "op_table": op_table,
         "operator_rows": operator_rows,
         "kernel_rows": kernel_rows,
+        "index_gather_rows": index_gather_rows,
+        "attention_kernel_rows": attention_kernel_rows,
         "kernel_warning": kernel_self_time_warning(kernel_rows, self_cuda_total_ms),
     }
 
@@ -341,7 +404,7 @@ def main():
     parser.add_argument(
         "--attn-backend",
         default="flash_attn",
-        choices=["flash_attn", "torch_paged", "triton_paged_decode"],
+        choices=["flash_attn", "torch_paged", "triton_paged_decode", "triton_paged_decode_v2"],
         help="Runtime attention backend. Custom paged backends currently require --enforce-eager.",
     )
     parser.add_argument("--warmup-steps", type=int, default=0)
@@ -399,11 +462,21 @@ def main():
         "Operator attribution is useful for understanding which model components cause CUDA work. "
         "It may include child CUDA kernels, so do not sum it as wall-clock time.",
         "## CUDA Kernel Self-Time Categories",
-        markdown_rows(result["kernel_rows"], ["category", "self_cuda_time_ms", "self_cpu_time_ms", "calls"]),
+        markdown_rows(result["kernel_rows"], [
+            "category",
+            "self_cuda_time_ms",
+            "self_cpu_time_ms",
+            "calls",
+            "avg_self_cuda_us",
+        ]),
         result["kernel_warning"],
         "Kernel self-time categories are better for deciding low-level optimization targets. "
         "Profiler overhead and CUDA asynchronous execution mean these numbers should explain bottleneck shape, "
         "not replace wall-clock E2E latency.",
+        "## Attention Kernel Events",
+        markdown_rows(result["attention_kernel_rows"], ["name", "self_cuda_time_ms", "calls", "avg_self_cuda_us"]),
+        "## Index / Gather Ops",
+        markdown_rows(result["index_gather_rows"], ["name", "self_cuda_time_ms", "cpu_total_ms", "calls", "avg_self_cuda_us"]),
         "## Top Ops",
         "```text\n" + result["op_table"] + "\n```",
     ])

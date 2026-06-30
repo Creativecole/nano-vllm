@@ -10,10 +10,12 @@ runtime choices. The default generation runtime remains FlashAttention.
 | `torch_sdpa` | prefill | PyTorch reference path |
 | `flash_attn` | prefill/runtime | stable nano-vLLM path, optional prefill benchmark |
 | `torch_paged` | decode | correctness reference over paged KV cache |
-| `triton_paged_decode` | decode | custom decode-only Triton PagedAttention kernel |
+| `triton_paged_decode` | decode | custom decode-only Triton PagedAttention v1 kernel |
+| `triton_paged_decode_v2` | decode | GQA-grouped Triton PagedAttention v2 kernel |
 
 The E2E `LLM.generate` path defaults to `flash_attn`. Custom decode backends can be selected with
-`attn_backend="torch_paged"` or `attn_backend="triton_paged_decode"` when `enforce_eager=True`.
+`attn_backend="torch_paged"`, `attn_backend="triton_paged_decode"`, or
+`attn_backend="triton_paged_decode_v2"` when `enforce_eager=True`.
 CUDA Graph capture for custom decode backends is not enabled yet.
 
 ## Current API
@@ -26,7 +28,7 @@ from nanovllm import LLM
 llm = LLM(
     "../models/Qwen3-4B",
     enforce_eager=True,
-    attn_backend="triton_paged_decode",
+    attn_backend="triton_paged_decode_v2",
 )
 ```
 
@@ -36,7 +38,7 @@ Standalone backend selection:
 from nanovllm.backends import paged_attention_decode
 
 out = paged_attention_decode(
-    "triton_paged_decode",
+    "triton_paged_decode_v2",
     q,
     k_cache,
     v_cache,
@@ -50,7 +52,7 @@ out = paged_attention_decode(
 
 ## Limitations
 
-- `triton_paged_decode` is decode-only.
+- Triton paged decode backends are decode-only.
 - `head_dim=128` is the first supported target.
 - Prefill currently compares Torch SDPA and FlashAttention; a Triton flash-style prefill kernel is TODO.
 - E2E custom backend integration is explicit and eager-only; CUDA Graph support remains TODO.

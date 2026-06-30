@@ -145,10 +145,16 @@ class Config:
         assert self.activation_backend in {"auto", "torch", "triton"}
         assert self.rope_backend in {"auto", "torch", "triton"}
         assert self.linear_backend in {"auto", "torch", "triton", "cuda"}
-        assert self.attn_backend in {"torch_sdpa", "flash_attn", "torch_paged", "triton_paged_decode"}
+        assert self.attn_backend in {
+            "torch_sdpa",
+            "flash_attn",
+            "torch_paged",
+            "triton_paged_decode",
+            "triton_paged_decode_v2",
+        }
         if self.attn_backend == "torch_sdpa":
             raise ValueError("attn_backend='torch_sdpa' is a prefill benchmark backend, not an e2e runtime backend")
-        if self.attn_backend in {"torch_paged", "triton_paged_decode"} and not self.enforce_eager:
+        if self.attn_backend in {"torch_paged", "triton_paged_decode", "triton_paged_decode_v2"} and not self.enforce_eager:
             raise ValueError(
                 f"attn_backend='{self.attn_backend}' currently requires enforce_eager=True; "
                 "CUDA Graph integration is intentionally left for a later step"

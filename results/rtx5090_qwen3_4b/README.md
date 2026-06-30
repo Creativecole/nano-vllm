@@ -21,7 +21,7 @@ directory.
 | Model | Qwen3-4B |
 | Primary dtype | BF16 |
 | Attention target | Decode-only paged attention |
-| Backend names | `torch_paged`, `triton_paged_decode`, `torch_sdpa`, `flash_attn` |
+| Backend names | `torch_paged`, `triton_paged_decode`, `triton_paged_decode_v2`, `torch_sdpa`, `flash_attn` |
 
 ## Expected Artifacts
 
@@ -30,10 +30,14 @@ directory.
 | `attention_decode.md` / `.json` | `benchmarks/bench_attention_decode.py` | Decode-only paged attention latency/correctness |
 | `attention_prefill.md` / `.json` | `benchmarks/bench_attention_prefill.py` | Torch SDPA vs FlashAttention prefill comparison |
 | `qwen3_attention_summary.md` / `.json` | `benchmarks/bench_qwen3_4b_attention.py` | Main Qwen3-4B attention backend summary |
+| `v2_correctness_spotcheck.md` / `.json` | `benchmarks/bench_triton_paged_decode_v2.py` | Small correctness spot check with `torch_paged` reference |
+| `triton_paged_decode_v2.md` / `.json` | `benchmarks/bench_triton_paged_decode_v2.py` | Triton v1/v2 block-size and context performance sweep |
 | `e2e_flash_attn_baseline.md` / `.json` | `bench_e2e.py --attn-backend flash_attn` | Stable runtime baseline |
 | `e2e_triton_paged_decode.md` / `.json` | `bench_e2e.py --attn-backend triton_paged_decode --enforce-eager` | Experimental custom decode E2E run |
+| `e2e_triton_paged_decode_v2.md` / `.json` | `bench_e2e.py --attn-backend triton_paged_decode_v2 --enforce-eager` | v2 custom decode E2E run |
 | `profile_flash_attn_baseline.md` / `.json` | `profile_e2e.py --attn-backend flash_attn` | Runtime profiler baseline |
 | `profile_triton_paged_decode.md` / `.json` | `profile_e2e.py --attn-backend triton_paged_decode --enforce-eager` | Custom decode profiler evidence |
+| `profile_triton_paged_decode_v2.md` / `.json` | `profile_e2e.py --attn-backend triton_paged_decode_v2 --enforce-eager` | v2 profiler evidence |
 
 Do not hand-edit performance numbers. Generate them from scripts on the RTX 5090 machine.
 
@@ -53,12 +57,36 @@ python benchmarks/bench_attention_decode.py \
 python benchmarks/bench_qwen3_4b_attention.py \
   --model ../models/Qwen3-4B \
   --dtype bf16 \
-  --attn-backends torch_paged,triton_paged_decode \
+  --attn-backends torch_paged,triton_paged_decode,triton_paged_decode_v2 \
   --seq-lens 1024,4096,8192 \
   --batch-sizes 1,4,8 \
   --block-size 16 \
   --save-md results/rtx5090_qwen3_4b/qwen3_attention_summary.md \
   --save-json results/rtx5090_qwen3_4b/qwen3_attention_summary.json
+
+python benchmarks/bench_triton_paged_decode_v2.py \
+  --model ../models/Qwen3-4B \
+  --dtype bf16 \
+  --backends torch_paged,triton_paged_decode,triton_paged_decode_v2 \
+  --seq-lens 1024,4096 \
+  --batch-sizes 1,4 \
+  --block-sizes 16 \
+  --warmup 1 \
+  --repeat 3 \
+  --save-md results/rtx5090_qwen3_4b/v2_correctness_spotcheck.md \
+  --save-json results/rtx5090_qwen3_4b/v2_correctness_spotcheck.json
+
+python benchmarks/bench_triton_paged_decode_v2.py \
+  --model ../models/Qwen3-4B \
+  --dtype bf16 \
+  --backends triton_paged_decode,triton_paged_decode_v2 \
+  --seq-lens 1024,4096,8192,16384 \
+  --batch-sizes 1,4,8 \
+  --block-sizes 16,32,64,128,256 \
+  --warmup 5 \
+  --repeat 20 \
+  --save-md results/rtx5090_qwen3_4b/triton_paged_decode_v2.md \
+  --save-json results/rtx5090_qwen3_4b/triton_paged_decode_v2.json
 
 python benchmarks/bench_attention_prefill.py \
   --model ../models/Qwen3-4B \
@@ -79,6 +107,16 @@ python bench_e2e.py \
   --save-md results/rtx5090_qwen3_4b/e2e_triton_paged_decode.md \
   --save-json results/rtx5090_qwen3_4b/e2e_triton_paged_decode.json
 
+python bench_e2e.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-new-tokens 128 \
+  --attn-backend triton_paged_decode_v2 \
+  --enforce-eager \
+  --save-md results/rtx5090_qwen3_4b/e2e_triton_paged_decode_v2.md \
+  --save-json results/rtx5090_qwen3_4b/e2e_triton_paged_decode_v2.json
+
 python profile_e2e.py \
   --model ../models/Qwen3-4B \
   --prompt-len 512 \
@@ -91,7 +129,20 @@ python profile_e2e.py \
   --record-shapes \
   --trace-output results/rtx5090_qwen3_4b/profile_triton_paged_decode.json \
   --summary-output results/rtx5090_qwen3_4b/profile_triton_paged_decode.md
+
+python profile_e2e.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-tokens 128 \
+  --attn-backend triton_paged_decode_v2 \
+  --enforce-eager \
+  --profile-steps 64 \
+  --profile-memory \
+  --record-shapes \
+  --trace-output results/rtx5090_qwen3_4b/profile_triton_paged_decode_v2.json \
+  --summary-output results/rtx5090_qwen3_4b/profile_triton_paged_decode_v2.md
 ```
 
-`triton_paged_decode` is an explicit eager-mode runtime experiment. Keep `flash_attn` as the default
-runtime baseline until custom decode wins are validated by E2E and profiler artifacts.
+Triton paged decode backends are explicit eager-mode runtime experiments. Keep `flash_attn` as the
+default runtime baseline until custom decode wins are validated by E2E and profiler artifacts.

@@ -7,6 +7,7 @@ from inspect import signature
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.kernels.attention.torch_paged_attention import torch_paged_attention_decode
 from nanovllm.kernels.attention.triton_paged_decode import triton_paged_attention_decode
+from nanovllm.kernels.attention.triton_paged_decode_v2 import triton_paged_attention_decode_v2
 from nanovllm.utils.context import get_context
 
 
@@ -171,6 +172,16 @@ class Attention(nn.Module):
                 )
             elif self.attn_backend == "triton_paged_decode":
                 o = triton_paged_attention_decode(
+                    q,
+                    k_cache,
+                    v_cache,
+                    context.block_tables,
+                    context.context_lens,
+                    scale=self.scale,
+                    block_size=self.block_size,
+                )
+            elif self.attn_backend == "triton_paged_decode_v2":
+                o = triton_paged_attention_decode_v2(
                     q,
                     k_cache,
                     v_cache,
