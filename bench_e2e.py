@@ -210,6 +210,7 @@ def format_benchmark_output(rows: list[dict]) -> str:
     if len(rows) == 1:
         row = dict(rows[0])
         row.pop("run", None)
+        row.pop("git_commit", None)
         return markdown_table(row)
 
     summary_keys = [
@@ -245,7 +246,6 @@ def format_benchmark_output(rows: list[dict]) -> str:
         "prefix_cache_hit_rate",
     ]
     config_keys = [
-        "git_commit",
         "model",
         "gpu",
         "prompt_len",
