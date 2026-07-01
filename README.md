@@ -44,22 +44,22 @@ GQA, online softmax, and paged KV block tables. Runtime use is explicit and eage
 
 ## RTX 5090 Results
 
-Environment: Qwen3-4B, BF16, single RTX 5090, prompt length 512, 4 prompts, 128 generated tokens,
-repeat 3 for the E2E table. Profiler cleanup numbers use 64 profiled steps. Full artifacts are
-under [`results/rtx5090_qwen3_4b`](results/rtx5090_qwen3_4b/).
+Environment: Qwen3-4B, BF16, single RTX 5090, prompt length 512, 4 prompts. The E2E table uses
+128 generated tokens, block size 256, and repeat 3. Profiler cleanup numbers use 64 profiled
+steps. Full artifacts are under [`results/rtx5090_qwen3_4b`](results/rtx5090_qwen3_4b/).
 
-### End-to-End Decode
+### End-to-End Decode after RoPE Cleanup
 
-| Runtime backend | Decode tokens/s mean | Avg ITL mean | TTFT mean | Peak memory |
+| Runtime backend | Decode tokens/s mean | Avg ITL mean | Decode step p50 | Decode step p95 |
 |---|---:|---:|---:|---:|
-| `flash_attn` | 240.34 | 4.17 ms | 97.9 ms | 27.38 GB |
-| `triton_paged_decode` | 210.68 | 4.75 ms | 100.2 ms | 27.38 GB |
-| `triton_paged_decode_v2` | 157.77 | 6.34 ms | 105.5 ms | 27.38 GB |
+| `flash_attn` | 263.09 | 3.80 ms | 14.81 ms | 15.28 ms |
+| `triton_paged_decode` | 247.68 | 4.04 ms | 16.10 ms | 16.52 ms |
+| `triton_paged_decode_v2` | 247.71 | 4.04 ms | 16.06 ms | 16.52 ms |
 
-The Triton backends are wired into the real generation path and produce stable E2E runs. In this
-workload, FlashAttention remains the fastest end-to-end backend, so it stays the default runtime
-path. The v2 backend is kept as a profiler-guided kernel iteration rather than a production
-replacement.
+After RoPE indexing cleanup, FlashAttention remains the fastest end-to-end backend. The Triton v1/v2
+backends are effectively tied in E2E throughput on this workload. The v2 backend is kept as a
+profiler-guided attention kernel iteration because it reduces Triton decode attention kernel
+self-time, but the full E2E decode path is still dominated by BF16 Linear/GEMM and runtime overhead.
 
 ### Paged Decode Attention Microbenchmark
 
@@ -75,48 +75,51 @@ Representative Qwen3-4B BF16 decode attention numbers from
 
 This benchmark isolates the attention backend. It is not reported as an E2E speedup.
 
-### Profiler Snapshot
+### Profiler: Triton PagedAttention v1 -> v2
 
-The E2E profiler shows that Qwen3-4B decode is still dominated by BF16 Linear/GEMM kernels. It also
-separates the custom Triton decode kernel from the rest of the model runtime:
+| Metric | `triton_paged_decode` | `triton_paged_decode_v2` |
+|---|---:|---:|
+| Triton decode kernel self-time | 81.2 ms | 61.9 ms |
+| Triton decode kernel avg latency | 35.8 us/call | 27.3 us/call |
+| Attention self CUDA time | 84.0 ms | 64.6 ms |
 
-| Backend | Linear/GEMM self CUDA | Attention kernel self CUDA | Attention detail |
-|---|---:|---:|---|
-| `flash_attn` | 424.18 ms | 30.51 ms | FlashAttention split-KV kernels |
-| `triton_paged_decode` | 424.31 ms | 82.75 ms | 36.49 us/call |
-| `triton_paged_decode_v2` | 422.83 ms | 62.23 ms | 27.44 us/call |
+v2 reduces Triton decode attention kernel self-time by about 24% in this profile run. This is a
+kernel/profiler attribution result, not a broad E2E speedup claim.
 
 Profiler traces:
 [`profile_flash_attn.md`](results/rtx5090_qwen3_4b/profile_flash_attn.md),
 [`profile_triton_paged_decode.md`](results/rtx5090_qwen3_4b/profile_triton_paged_decode.md),
 [`profile_triton_paged_decode_v2.md`](results/rtx5090_qwen3_4b/profile_triton_paged_decode_v2.md).
 
-v2 reduces the profiled Triton attention kernel self-time, but its current E2E path is slower than
-v1. That gap points to runtime integration and decode-step overhead as the next optimization target,
-not just the inner attention kernel.
-
 ### Profiler-Guided RoPE Indexing Cleanup
 
 The original RoPE path materialized `cos_cache[positions]` and `sin_cache[positions]` through
-PyTorch advanced indexing. This created thousands of `aten::index` and `vectorized_gather_kernel`
-calls during decode. This fork moves RoPE cos/sin lookup into the Triton rotary kernel: the kernel
-now receives `positions`, `cos_cache`, and `sin_cache` directly and loads cos/sin by pointer
-arithmetic.
+PyTorch advanced indexing. This created thousands of small indexing and gather operations during
+decode.
 
-Qwen3-4B BF16 / RTX 5090 / `triton_paged_decode_v2` / prompt length 512 / 4 prompts / 64 profiled
-steps:
+This fork moves RoPE cos/sin lookup into the Triton rotary kernel. The kernel receives `positions`,
+`cos_cache`, and `sin_cache` directly and loads cos/sin using pointer arithmetic. This does not
+change attention kernel math.
 
-| Metric | Before | After |
+| Metric | Before cleanup | After cleanup |
 |---|---:|---:|
 | `aten::index` calls | 4609 | 1 |
 | `vectorized_gather_kernel` calls | 4610 | 2 |
-| Decode time | 2.389 s | 1.738 s |
-| Kernel launch/runtime calls | 37472 | 23584 |
-| `cudaLaunchKernel` calls | 5159 | 551 |
 
-This removes PyTorch-side RoPE indexing overhead without changing attention kernel math. The RoPE
-kernel itself becomes slightly heavier because it performs the cos/sin pointer loads directly, but
-the overall decode path is cleaner and faster in the profiler.
+The cleanup happens before the attention backend, so `flash_attn`, `triton_paged_decode`, and
+`triton_paged_decode_v2` all benefit from it.
+
+### Profiler Interpretation
+
+The profiler shows that Triton decode attention can be optimized locally, but full decode is still
+dominated by BF16 Linear/GEMM and runtime overhead. In the same profile setup, Linear/GEMM self CUDA
+time is about 421 ms, much larger than the custom attention kernel self-time.
+
+This project reports three separate levels:
+
+1. Microbenchmark: isolated attention backend latency.
+2. Profiler: kernel self-time and operator attribution.
+3. E2E benchmark: real generation path throughput.
 
 ## Install
 
@@ -153,9 +156,12 @@ llm = LLM(
     "../models/Qwen3-4B",
     enforce_eager=True,
     tensor_parallel_size=1,
-    attn_backend="triton_paged_decode_v2",
+    attn_backend="triton_paged_decode",
 )
 ```
+
+`triton_paged_decode_v2` is also available as an experimental profiler-guided kernel iteration, but
+it is not the default runtime backend.
 
 ## Reproduce
 

@@ -23,6 +23,57 @@ directory.
 | Attention target | Decode-only paged attention |
 | Backend names | `torch_paged`, `triton_paged_decode`, `triton_paged_decode_v2`, `torch_sdpa`, `flash_attn` |
 
+## Result Summary
+
+The result set separates real generation throughput, isolated attention-kernel latency, and profiler
+attribution. Do not mix these numbers into a single speedup claim.
+
+### End-to-End Decode after RoPE Cleanup
+
+Qwen3-4B, BF16, single RTX 5090, prompt length 512, 4 prompts, 128 generated tokens, block size 256,
+repeat 3.
+
+| Runtime backend | Decode tokens/s mean | Avg ITL mean | Decode step p50 | Decode step p95 |
+|---|---:|---:|---:|---:|
+| `flash_attn` | 263.09 | 3.80 ms | 14.81 ms | 15.28 ms |
+| `triton_paged_decode` | 247.68 | 4.04 ms | 16.10 ms | 16.52 ms |
+| `triton_paged_decode_v2` | 247.71 | 4.04 ms | 16.06 ms | 16.52 ms |
+
+FlashAttention remains the fastest E2E backend. Triton v1/v2 are effectively tied in this workload
+after RoPE indexing cleanup.
+
+### Isolated Paged Decode Attention
+
+| Batch | Context | Block | v1 p50 | v2 p50 | v1 -> v2 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1024 | 32 | 0.2690 ms | 0.0964 ms | 2.79x faster |
+| 4 | 4096 | 16 | 0.2755 ms | 0.1922 ms | 1.43x faster |
+| 8 | 8192 | 64 | 0.5481 ms | 0.3729 ms | 1.47x faster |
+| 8 | 16384 | 128 | 1.0211 ms | 0.6733 ms | 1.52x faster |
+
+This is an isolated attention-backend microbenchmark, not an E2E speedup.
+
+### Profiler Attribution
+
+| Metric | `triton_paged_decode` | `triton_paged_decode_v2` |
+|---|---:|---:|
+| Triton decode kernel self-time | 81.2 ms | 61.9 ms |
+| Triton decode kernel avg latency | 35.8 us/call | 27.3 us/call |
+| Attention self CUDA time | 84.0 ms | 64.6 ms |
+
+v2 reduces Triton decode attention kernel self-time by about 24% in this profile run. Full decode
+is still dominated by BF16 Linear/GEMM and runtime overhead.
+
+### RoPE Indexing Cleanup
+
+| Metric | Before cleanup | After cleanup |
+|---|---:|---:|
+| `aten::index` calls | 4609 | 1 |
+| `vectorized_gather_kernel` calls | 4610 | 2 |
+
+The RoPE cleanup moves cos/sin lookup into the Triton rotary kernel and benefits all runtime
+attention backends because it happens before attention.
+
 ## Expected Artifacts
 
 | File | Source command | Purpose |
