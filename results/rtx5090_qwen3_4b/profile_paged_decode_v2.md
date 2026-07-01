@@ -18,7 +18,7 @@
 | prefill_time_s | 0.0808 |
 | decode_time_s | 1.4353 |
 | elapsed_s | 2.7180 |
-| trace_output | results/rtx5090_qwen3_4b/profile_v2_after_rope_cleanup.json |
+| trace_output | results/rtx5090_qwen3_4b/profile_paged_decode_v2.json |
 | profile_memory | True |
 | record_shapes | True |
 | with_stack | False |
