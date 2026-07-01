@@ -60,6 +60,7 @@ After RoPE indexing cleanup, FlashAttention remains the fastest end-to-end backe
 backends are effectively tied in E2E throughput on this workload. The v2 backend is kept as a
 profiler-guided attention kernel iteration because it reduces Triton decode attention kernel
 self-time, but the full E2E decode path is still dominated by BF16 Linear/GEMM and runtime overhead.
+Source: [`e2e_all_backends_after_rope_cleanup.md`](results/rtx5090_qwen3_4b/e2e_all_backends_after_rope_cleanup.md).
 
 ### Paged Decode Attention Microbenchmark
 
@@ -87,9 +88,8 @@ v2 reduces Triton decode attention kernel self-time by about 24% in this profile
 kernel/profiler attribution result, not a broad E2E speedup claim.
 
 Profiler traces:
-[`profile_flash_attn.md`](results/rtx5090_qwen3_4b/profile_flash_attn.md),
-[`profile_triton_paged_decode.md`](results/rtx5090_qwen3_4b/profile_triton_paged_decode.md),
-[`profile_triton_paged_decode_v2.md`](results/rtx5090_qwen3_4b/profile_triton_paged_decode_v2.md).
+[`profile_v1_after_rope_cleanup.md`](results/rtx5090_qwen3_4b/profile_v1_after_rope_cleanup.md),
+[`profile_v2_after_rope_cleanup.md`](results/rtx5090_qwen3_4b/profile_v2_after_rope_cleanup.md).
 
 ### Profiler-Guided RoPE Indexing Cleanup
 
@@ -108,6 +108,7 @@ change attention kernel math.
 
 The cleanup happens before the attention backend, so `flash_attn`, `triton_paged_decode`, and
 `triton_paged_decode_v2` all benefit from it.
+Source: [`profile_rope_indexing_cleanup.md`](results/rtx5090_qwen3_4b/profile_rope_indexing_cleanup.md).
 
 ### Profiler Interpretation
 
