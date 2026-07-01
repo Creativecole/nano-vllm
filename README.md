@@ -45,7 +45,8 @@ GQA, online softmax, and paged KV block tables. Runtime use is explicit and eage
 ## RTX 5090 Results
 
 Environment: Qwen3-4B, BF16, single RTX 5090, prompt length 512, 4 prompts, 128 generated tokens,
-repeat 3. Full artifacts are under [`results/rtx5090_qwen3_4b`](results/rtx5090_qwen3_4b/).
+repeat 3 for the E2E table. Profiler cleanup numbers use 64 profiled steps. Full artifacts are
+under [`results/rtx5090_qwen3_4b`](results/rtx5090_qwen3_4b/).
 
 ### End-to-End Decode
 
@@ -93,6 +94,29 @@ Profiler traces:
 v2 reduces the profiled Triton attention kernel self-time, but its current E2E path is slower than
 v1. That gap points to runtime integration and decode-step overhead as the next optimization target,
 not just the inner attention kernel.
+
+### Profiler-Guided RoPE Indexing Cleanup
+
+The original RoPE path materialized `cos_cache[positions]` and `sin_cache[positions]` through
+PyTorch advanced indexing. This created thousands of `aten::index` and `vectorized_gather_kernel`
+calls during decode. This fork moves RoPE cos/sin lookup into the Triton rotary kernel: the kernel
+now receives `positions`, `cos_cache`, and `sin_cache` directly and loads cos/sin by pointer
+arithmetic.
+
+Qwen3-4B BF16 / RTX 5090 / `triton_paged_decode_v2` / prompt length 512 / 4 prompts / 64 profiled
+steps:
+
+| Metric | Before | After |
+|---|---:|---:|
+| `aten::index` calls | 4609 | 1 |
+| `vectorized_gather_kernel` calls | 4610 | 2 |
+| Decode time | 2.389 s | 1.738 s |
+| Kernel launch/runtime calls | 37472 | 23584 |
+| `cudaLaunchKernel` calls | 5159 | 551 |
+
+This removes PyTorch-side RoPE indexing overhead without changing attention kernel math. The RoPE
+kernel itself becomes slightly heavier because it performs the cos/sin pointer loads directly, but
+the overall decode path is cleaner and faster in the profiler.
 
 ## Install
 
