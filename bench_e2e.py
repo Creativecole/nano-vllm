@@ -142,6 +142,8 @@ def run_once(args, run_index: int, LLM, SamplingParams):
             max_num_seqs=args.num_prompts,
             enforce_eager=args.enforce_eager,
             attn_backend=args.attn_backend,
+            kvcache_block_size=args.block_size,
+            triton_paged_decode_auto_threshold=args.auto_threshold,
         )
         prompt = make_token_prompt(llm, args.prompt_len)
         prompts = [prompt[:] for _ in range(args.num_prompts)]
@@ -200,6 +202,8 @@ def run_once(args, run_index: int, LLM, SamplingParams):
             "rope_backend": metrics["rope_backend"],
             "linear_backend": metrics["linear_backend"],
             "attn_backend": metrics["attn_backend"],
+            "kvcache_block_size": metrics["kvcache_block_size"],
+            "triton_paged_decode_auto_threshold": metrics["triton_paged_decode_auto_threshold"],
         }
     finally:
         if llm is not None:
@@ -255,6 +259,8 @@ def format_benchmark_output(rows: list[dict]) -> str:
         "kv_cache_dtype",
         "linear_backend",
         "attn_backend",
+        "kvcache_block_size",
+        "triton_paged_decode_auto_threshold",
         "norm_backend",
         "activation_backend",
         "rope_backend",
@@ -281,13 +287,26 @@ def main():
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=0)
+    parser.add_argument("--block-size", type=int, default=256, choices=[16, 32, 64, 128, 256])
+    parser.add_argument(
+        "--auto-threshold",
+        type=int,
+        default=1024,
+        help="Context-length threshold for triton_paged_decode_auto.",
+    )
     parser.add_argument("--output", type=str, default=None, help="Deprecated alias for --save-md.")
     parser.add_argument("--save-md", type=str, default=None)
     parser.add_argument("--save-json", type=str, default=None)
     parser.add_argument(
         "--attn-backend",
         default="flash_attn",
-        choices=["flash_attn", "torch_paged", "triton_paged_decode", "triton_paged_decode_v2"],
+        choices=[
+            "flash_attn",
+            "torch_paged",
+            "triton_paged_decode",
+            "triton_paged_decode_v2",
+            "triton_paged_decode_auto",
+        ],
         help="Runtime decode attention backend. Custom paged backends currently require --enforce-eager.",
     )
     args = parser.parse_args()

@@ -12,10 +12,13 @@ runtime choices. The default generation runtime remains FlashAttention.
 | `torch_paged` | decode | correctness reference over paged KV cache |
 | `triton_paged_decode` | decode | custom decode-only Triton PagedAttention v1 kernel |
 | `triton_paged_decode_v2` | decode | GQA-grouped Triton PagedAttention v2 kernel |
+| `triton_paged_decode_auto` | decode | experimental context-length threshold policy over v1/v2 |
 
 The E2E `LLM.generate` path defaults to `flash_attn`. Custom decode backends can be selected with
 `attn_backend="torch_paged"`, `attn_backend="triton_paged_decode"`, or
-`attn_backend="triton_paged_decode_v2"` when `enforce_eager=True`.
+`attn_backend="triton_paged_decode_v2"` when `enforce_eager=True`. The auto policy is selected with
+`attn_backend="triton_paged_decode_auto"` and currently uses v1 below the configured context-length
+threshold and v2 at or above it.
 CUDA Graph capture for custom decode backends is not enabled yet.
 
 ## Current API

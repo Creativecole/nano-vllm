@@ -18,11 +18,13 @@ def _next_power_of_2(n):
 @triton.jit
 def _rotary_embedding_kernel(
     qk_ptr,         # [N, num_heads, head_dim]  — q or k
-    cos_ptr,         # [N, 1, half_dim]  — cos values per position
-    sin_ptr,         # [N, 1, half_dim]  — sin values per position
+    positions_ptr,  # [N] token positions
+    cos_ptr,         # [max_position, 1, half_dim]
+    sin_ptr,         # [max_position, 1, half_dim]
     stride_qk_n,    # stride along token dim
     stride_qk_h,    # stride along head dim
-    stride_cs_n,    # stride along token dim for cos/sin
+    stride_pos_n,   # stride along positions dim
+    stride_cs_pos,  # stride along position dim for cos/sin cache
     HALF_DIM: tl.constexpr,
     BLOCK_HD: tl.constexpr,
 ):
@@ -37,8 +39,10 @@ def _rotary_embedding_kernel(
     x1 = tl.load(qk_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
     x2 = tl.load(qk_ptr + base + HALF_DIM + cols, mask=mask, other=0.0).to(tl.float32)
 
-    # load cos, sin for this token  (broadcast across heads via stride_cs_n)
-    cs_base = token_id * stride_cs_n
+    # Load cos/sin directly from the cache by logical position. This avoids
+    # materializing cos_cache[positions] and sin_cache[positions] in Python.
+    position = tl.load(positions_ptr + token_id * stride_pos_n)
+    cs_base = position * stride_cs_pos
     cos = tl.load(cos_ptr + cs_base + cols, mask=mask, other=0.0).to(tl.float32)
     sin = tl.load(sin_ptr + cs_base + cols, mask=mask, other=0.0).to(tl.float32)
 
@@ -78,25 +82,22 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos = self.cos_cache[positions]   # [N, 1, half_dim]
-        sin = self.sin_cache[positions]   # [N, 1, half_dim]
-
         N = query.shape[0]
         num_q_heads = query.shape[1]
         num_k_heads = key.shape[1]
-
-        stride_cs_n = cos.stride(0)
+        stride_pos_n = positions.stride(0)
+        stride_cs_pos = self.cos_cache.stride(0)
 
         # in-place rotary on query: grid = (N_tokens, num_q_heads)
         _rotary_embedding_kernel[(N, num_q_heads)](
-            query, cos, sin,
-            query.stride(0), query.stride(1), stride_cs_n,
+            query, positions, self.cos_cache, self.sin_cache,
+            query.stride(0), query.stride(1), stride_pos_n, stride_cs_pos,
             HALF_DIM=self.half_dim, BLOCK_HD=self.block_hd,
         )
         # in-place rotary on key: grid = (N_tokens, num_k_heads)
         _rotary_embedding_kernel[(N, num_k_heads)](
-            key, cos, sin,
-            key.stride(0), key.stride(1), stride_cs_n,
+            key, positions, self.cos_cache, self.sin_cache,
+            key.stride(0), key.stride(1), stride_pos_n, stride_cs_pos,
             HALF_DIM=self.half_dim, BLOCK_HD=self.block_hd,
         )
         return query, key

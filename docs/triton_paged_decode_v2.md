@@ -94,10 +94,40 @@ python profile_e2e.py \
   --summary-output results/rtx5090_qwen3_4b/profile_triton_paged_decode_v2.md
 ```
 
+Diagnose why kernel-level gains do or do not survive E2E:
+
+```bash
+python benchmarks/bench_e2e_v1_v2_sweep.py \
+  --model ../models/Qwen3-4B \
+  --backends triton_paged_decode,triton_paged_decode_v2 \
+  --prompt-lens 512,1024,2048,4096,8192 \
+  --block-sizes 16,32,64,128,256 \
+  --num-prompts 4 \
+  --max-new-tokens 128 \
+  --enforce-eager \
+  --save-md results/rtx5090_qwen3_4b/e2e_v1_v2_prompt_block_sweep.md \
+  --save-json results/rtx5090_qwen3_4b/e2e_v1_v2_prompt_block_sweep.json
+
+python profile_e2e.py \
+  --model ../models/Qwen3-4B \
+  --prompt-len 512 \
+  --num-prompts 4 \
+  --max-tokens 64 \
+  --compare-backends triton_paged_decode,triton_paged_decode_v2 \
+  --enforce-eager \
+  --profile-steps 64 \
+  --profile-memory \
+  --record-shapes \
+  --trace-output results/rtx5090_qwen3_4b/profile_v1_v2_diff_trace.json \
+  --diff-summary-output results/rtx5090_qwen3_4b/profile_v1_v2_diff.md \
+  --diff-json-output results/rtx5090_qwen3_4b/profile_v1_v2_diff.json
+```
+
 ## Current Status
 
 - v1 remains available as `triton_paged_decode`.
 - v2 is available as `triton_paged_decode_v2`.
+- `triton_paged_decode_auto` is available as an experimental threshold policy.
 - The default runtime backend remains `flash_attn`.
 - v2 is decode-only and eager-mode only.
 - Split-KV parallelism is not enabled in the main path; it remains a separate future prototype.

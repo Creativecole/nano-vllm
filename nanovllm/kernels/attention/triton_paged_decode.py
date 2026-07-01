@@ -75,6 +75,16 @@ def _triton_paged_decode_kernel(
     tl.store(out_ptr + out_offset, out)
 
 
+def _contiguous_if_needed(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor if tensor.is_contiguous() else tensor.contiguous()
+
+
+def _int32_cuda_contiguous(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    if tensor.device != device or tensor.dtype != torch.int32:
+        tensor = tensor.to(device=device, dtype=torch.int32)
+    return _contiguous_if_needed(tensor)
+
+
 def triton_paged_attention_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -99,11 +109,11 @@ def triton_paged_attention_decode(
     num_kv_heads = k_cache.shape[2]
     if num_q_heads % num_kv_heads != 0:
         raise ValueError("num_q_heads must be divisible by num_kv_heads")
-    q = q.contiguous()
-    k_cache = k_cache.contiguous()
-    v_cache = v_cache.contiguous()
-    block_tables = block_tables.to(device=q.device, dtype=torch.int32).contiguous()
-    context_lens = context_lens.to(device=q.device, dtype=torch.int32).contiguous()
+    q = _contiguous_if_needed(q)
+    k_cache = _contiguous_if_needed(k_cache)
+    v_cache = _contiguous_if_needed(v_cache)
+    block_tables = _int32_cuda_contiguous(block_tables, q.device)
+    context_lens = _int32_cuda_contiguous(context_lens, q.device)
     out = torch.empty_like(q)
     scale = (head_dim ** -0.5) if scale is None else scale
     max_blocks = block_tables.shape[1]
@@ -127,4 +137,3 @@ def triton_paged_attention_decode(
         num_warps=4,
     )
     return out
-

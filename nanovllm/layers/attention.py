@@ -142,6 +142,7 @@ class Attention(nn.Module):
         layer_id: int = 0,
         attn_backend: str = "flash_attn",
         block_size: int = 256,
+        triton_paged_decode_auto_threshold: int = 1024,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -151,7 +152,15 @@ class Attention(nn.Module):
         self.layer_id = layer_id
         self.attn_backend = attn_backend
         self.block_size = block_size
+        self.triton_paged_decode_auto_threshold = triton_paged_decode_auto_threshold
         self.k_cache = self.v_cache = torch.tensor([])
+
+    def _resolve_decode_backend(self, context) -> str:
+        if self.attn_backend != "triton_paged_decode_auto":
+            return self.attn_backend
+        if context.max_context_len < self.triton_paged_decode_auto_threshold:
+            return "triton_paged_decode"
+        return "triton_paged_decode_v2"
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
@@ -166,11 +175,12 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            if self.attn_backend == "flash_attn":
+            decode_backend = self._resolve_decode_backend(context)
+            if decode_backend == "flash_attn":
                 o = _call_flash_attn_with_kvcache(
                     q, k_cache, v_cache, context, self.scale,
                 )
-            elif self.attn_backend == "triton_paged_decode":
+            elif decode_backend == "triton_paged_decode":
                 o = triton_paged_attention_decode(
                     q,
                     k_cache,
@@ -180,7 +190,7 @@ class Attention(nn.Module):
                     scale=self.scale,
                     block_size=self.block_size,
                 )
-            elif self.attn_backend == "triton_paged_decode_v2":
+            elif decode_backend == "triton_paged_decode_v2":
                 o = triton_paged_attention_decode_v2(
                     q,
                     k_cache,
@@ -190,7 +200,7 @@ class Attention(nn.Module):
                     scale=self.scale,
                     block_size=self.block_size,
                 )
-            elif self.attn_backend == "torch_paged":
+            elif decode_backend == "torch_paged":
                 o = torch_paged_attention_decode(
                     q,
                     k_cache,

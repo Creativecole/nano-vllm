@@ -12,6 +12,7 @@ ATTENTION_BACKENDS = {
     "torch_paged",
     "triton_paged_decode",
     "triton_paged_decode_v2",
+    "triton_paged_decode_auto",
 }
 
 
@@ -29,7 +30,7 @@ def require_backend(name: str) -> None:
             import flash_attn  # noqa: F401
         except Exception as exc:  # pragma: no cover - depends on optional CUDA wheel
             raise AttentionBackendError("flash_attn backend requested, but flash-attn is not importable") from exc
-    if name in {"triton_paged_decode", "triton_paged_decode_v2"}:
+    if name in {"triton_paged_decode", "triton_paged_decode_v2", "triton_paged_decode_auto"}:
         try:
             import triton  # noqa: F401
         except Exception as exc:  # pragma: no cover
@@ -47,8 +48,12 @@ def paged_attention_decode(
     context_lens: torch.Tensor,
     scale: float | None = None,
     block_size: int = 16,
+    auto_threshold: int = 1024,
 ) -> torch.Tensor:
     require_backend(backend)
+    if backend == "triton_paged_decode_auto":
+        max_context_len = int(context_lens.max().item()) if context_lens.numel() else 0
+        backend = "triton_paged_decode" if max_context_len < auto_threshold else "triton_paged_decode_v2"
     if backend == "torch_paged":
         return torch_paged_attention_decode(q, k_cache, v_cache, block_tables, context_lens, scale, block_size)
     if backend == "triton_paged_decode":

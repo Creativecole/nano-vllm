@@ -29,7 +29,7 @@ def test_torch_paged_attention_decode_is_self_consistent_cpu():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton paged attention")
-@pytest.mark.parametrize("backend", ["triton_paged_decode", "triton_paged_decode_v2"])
+@pytest.mark.parametrize("backend", ["triton_paged_decode", "triton_paged_decode_v2", "triton_paged_decode_auto"])
 def test_triton_paged_attention_decode_matches_torch_reference(backend):
     pytest.importorskip("triton")
     q, k_cache, v_cache, block_tables, context_lens, block_size = make_inputs("cuda")

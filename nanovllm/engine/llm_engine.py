@@ -74,6 +74,7 @@ class LLMEngine:
             "rope_backend": config.rope_backend,
             "linear_backend": config.linear_backend,
             "attn_backend": config.attn_backend,
+            "triton_paged_decode_auto_threshold": config.triton_paged_decode_auto_threshold,
         })
         return metrics
 

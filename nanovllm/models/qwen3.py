@@ -27,6 +27,7 @@ class Qwen3Attention(nn.Module):
         layer_id: int = 0,
         attn_backend: str = "flash_attn",
         block_size: int = 256,
+        triton_paged_decode_auto_threshold: int = 1024,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -70,6 +71,7 @@ class Qwen3Attention(nn.Module):
             layer_id=layer_id,
             attn_backend=attn_backend,
             block_size=block_size,
+            triton_paged_decode_auto_threshold=triton_paged_decode_auto_threshold,
         )
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -144,6 +146,7 @@ class Qwen3DecoderLayer(nn.Module):
             layer_id=layer_id,
             attn_backend=getattr(config, "attn_backend", "flash_attn"),
             block_size=getattr(config, "kvcache_block_size", 256),
+            triton_paged_decode_auto_threshold=getattr(config, "triton_paged_decode_auto_threshold", 1024),
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,

@@ -132,6 +132,7 @@ class Config:
     rope_backend: str = "triton"
     linear_backend: str = "torch"
     attn_backend: str = "flash_attn"
+    triton_paged_decode_auto_threshold: int = 1024
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
@@ -139,8 +140,9 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        assert self.kvcache_block_size % 256 == 0
+        assert self.kvcache_block_size in {16, 32, 64, 128, 256}
         assert 1 <= self.tensor_parallel_size <= 8
+        assert self.triton_paged_decode_auto_threshold >= 1
         assert self.norm_backend in {"auto", "torch", "triton"}
         assert self.activation_backend in {"auto", "torch", "triton"}
         assert self.rope_backend in {"auto", "torch", "triton"}
@@ -151,10 +153,16 @@ class Config:
             "torch_paged",
             "triton_paged_decode",
             "triton_paged_decode_v2",
+            "triton_paged_decode_auto",
         }
         if self.attn_backend == "torch_sdpa":
             raise ValueError("attn_backend='torch_sdpa' is a prefill benchmark backend, not an e2e runtime backend")
-        if self.attn_backend in {"torch_paged", "triton_paged_decode", "triton_paged_decode_v2"} and not self.enforce_eager:
+        if self.attn_backend in {
+            "torch_paged",
+            "triton_paged_decode",
+            "triton_paged_decode_v2",
+            "triton_paged_decode_auto",
+        } and not self.enforce_eager:
             raise ValueError(
                 f"attn_backend='{self.attn_backend}' currently requires enforce_eager=True; "
                 "CUDA Graph integration is intentionally left for a later step"
@@ -167,4 +175,5 @@ class Config:
         self.hf_config.dtype = dtype
         self.hf_config.attn_backend = self.attn_backend
         self.hf_config.kvcache_block_size = self.kvcache_block_size
+        self.hf_config.triton_paged_decode_auto_threshold = self.triton_paged_decode_auto_threshold
         self.max_model_len = min(self.max_model_len, max_position_embeddings)
