@@ -342,7 +342,12 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(
+        self,
+        seqs: list[Sequence],
+        is_prefill: bool,
+        return_logits: bool = False,
+    ):
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         layer_states = None
@@ -354,7 +359,10 @@ class ModelRunner:
         if layer_states is not None:
             self.hybrid_state_manager.commit(layer_states)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        logits_cpu = logits.float().cpu() if return_logits and self.rank == 0 else None
         reset_context()
+        if return_logits:
+            return token_ids, logits_cpu
         return token_ids
 
     def release_states(self, seq_ids: list[int]):
@@ -364,10 +372,22 @@ class ModelRunner:
     def get_hybrid_state_stats(self):
         if self.hybrid_state_manager is None:
             return None
+        delta_bytes_per_sequence = delta_state_bytes_per_sequence(
+            self.layer_state_specs
+        )
+        kv_bytes_per_block = paged_kv_bytes_per_block(
+            self.layer_state_specs, self.block_size
+        )
         return {
             "capacity": self.hybrid_state_manager.capacity,
             "allocated": self.hybrid_state_manager.allocated_count,
             "free": self.hybrid_state_manager.free_count,
+            "delta_bytes_per_sequence": delta_bytes_per_sequence,
+            "delta_pool_bytes": self.hybrid_state_manager.capacity
+            * delta_bytes_per_sequence,
+            "kv_bytes_per_block": kv_bytes_per_block,
+            "num_kv_blocks": self.config.num_kvcache_blocks,
+            "kv_cache_bytes": self.config.num_kvcache_blocks * kv_bytes_per_block,
         }
 
     @torch.inference_mode()

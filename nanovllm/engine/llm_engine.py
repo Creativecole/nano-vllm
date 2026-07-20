@@ -49,6 +49,18 @@ class LLMEngine:
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq.seq_id
+
+    def _finish_step(self, seqs, token_ids, is_prefill):
+        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        released_seq_ids = self.scheduler.drain_released_seq_ids()
+        if released_seq_ids:
+            self.model_runner.call("release_states", released_seq_ids)
+        return [
+            (seq.seq_id, seq.completion_token_ids)
+            for seq in seqs
+            if seq.is_finished
+        ]
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
@@ -57,12 +69,28 @@ class LLMEngine:
             self.model_runner.call("release_states", released_seq_ids)
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        outputs = self._finish_step(seqs, token_ids, is_prefill)
+        return outputs, num_tokens
+
+    def step_with_logits(self):
+        """Run the normal serving step and return per-request logits for validation."""
+        seqs, is_prefill = self.scheduler.schedule()
         released_seq_ids = self.scheduler.drain_released_seq_ids()
         if released_seq_ids:
             self.model_runner.call("release_states", released_seq_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+        num_tokens = (
+            sum(seq.num_scheduled_tokens for seq in seqs)
+            if is_prefill
+            else -len(seqs)
+        )
+        token_ids, logits = self.model_runner.call(
+            "run", seqs, is_prefill, True
+        )
+        step_logits = {
+            seq.seq_id: logits[row] for row, seq in enumerate(seqs)
+        }
+        outputs = self._finish_step(seqs, token_ids, is_prefill)
+        return outputs, num_tokens, step_logits
 
     def is_finished(self):
         return self.scheduler.is_finished()
