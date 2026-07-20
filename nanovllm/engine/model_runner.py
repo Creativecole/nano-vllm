@@ -17,6 +17,7 @@ from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.profiler import profile_range
 
 
 class ModelRunner:
@@ -348,16 +349,25 @@ class ModelRunner:
         is_prefill: bool,
         return_logits: bool = False,
     ):
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        with profile_range("qwen35_metadata_prepare"):
+            input_ids, positions = (
+                self.prepare_prefill(seqs)
+                if is_prefill
+                else self.prepare_decode(seqs)
+            )
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         layer_states = None
         if self.hybrid_state_manager is not None:
             seq_ids = [seq.seq_id for seq in seqs]
             self.hybrid_state_manager.allocate(seq_ids)
-            layer_states = self.hybrid_state_manager.gather(seq_ids)
-        logits = self.run_model(input_ids, positions, is_prefill, layer_states)
+            with profile_range("qwen35_state_gather"):
+                layer_states = self.hybrid_state_manager.gather(seq_ids)
+        phase = "prefill" if is_prefill else "decode"
+        with profile_range(f"qwen35_{phase}_model"):
+            logits = self.run_model(input_ids, positions, is_prefill, layer_states)
         if layer_states is not None:
-            self.hybrid_state_manager.commit(layer_states)
+            with profile_range("qwen35_state_commit"):
+                self.hybrid_state_manager.commit(layer_states)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         logits_cpu = logits.float().cpu() if return_logits and self.rank == 0 else None
         reset_context()

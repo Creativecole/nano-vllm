@@ -11,6 +11,7 @@ from nanovllm.engine.layer_state import (
     PagedKVStateSpec,
 )
 from nanovllm.utils.context import get_context
+from nanovllm.utils.profiler import profile_range
 
 
 def _config_value(config, name, default=None):
@@ -415,22 +416,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         # hidden_states: [batch, seq_len, hidden_size]
         batch_size, seq_len, _ = hidden_states.shape
-        raw_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        conv_input = torch.cat(
-            (layer_state.conv_state[:, :, 1:], raw_qkv), dim=-1
-        )
-        mixed_qkv = F.silu(
-            F.conv1d(
-                conv_input,
-                self.conv1d.weight,
-                self.conv1d.bias,
-                groups=self.conv_dim,
+        with profile_range("qwen35_deltanet_conv"):
+            raw_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+            conv_input = torch.cat(
+                (layer_state.conv_state[:, :, 1:], raw_qkv), dim=-1
             )
-        ).transpose(1, 2)
-        new_conv_state = torch.cat((layer_state.conv_state, raw_qkv), dim=-1)[
-            :, :, -self.conv_kernel_size :
-        ]
-        layer_state.conv_state.copy_(new_conv_state)
+            mixed_qkv = F.silu(
+                F.conv1d(
+                    conv_input,
+                    self.conv1d.weight,
+                    self.conv1d.bias,
+                    groups=self.conv_dim,
+                )
+            ).transpose(1, 2)
+            new_conv_state = torch.cat((layer_state.conv_state, raw_qkv), dim=-1)[
+                :, :, -self.conv_kernel_size :
+            ]
+            layer_state.conv_state.copy_(new_conv_state)
 
         query, key, value = mixed_qkv.split(
             (self.key_dim, self.key_dim, self.value_dim), dim=-1
@@ -445,20 +447,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         decay = -self.A_log.float().exp() * F.softplus(
             self.in_proj_a(hidden_states).float() + self.dt_bias.float()
         )
-        core_output, final_state = gated_delta_rule_reference(
-            query,
-            key,
-            value,
-            decay,
-            beta,
-            initial_state=layer_state.recurrent_state,
-        )
-        layer_state.recurrent_state.copy_(final_state)
-        z = self.in_proj_z(hidden_states).view(
-            batch_size, seq_len, self.num_v_heads, self.head_v_dim
-        )
-        output = self.norm(core_output, z).reshape(batch_size, seq_len, self.value_dim)
-        return self.out_proj(output)
+        with profile_range("qwen35_deltanet_recurrence"):
+            core_output, final_state = gated_delta_rule_reference(
+                query,
+                key,
+                value,
+                decay,
+                beta,
+                initial_state=layer_state.recurrent_state,
+            )
+            layer_state.recurrent_state.copy_(final_state)
+        with profile_range("qwen35_deltanet_output"):
+            z = self.in_proj_z(hidden_states).view(
+                batch_size, seq_len, self.num_v_heads, self.head_v_dim
+            )
+            output = self.norm(core_output, z).reshape(
+                batch_size, seq_len, self.value_dim
+            )
+            return self.out_proj(output)
 
     def _forward_packed(
         self,
@@ -579,22 +585,25 @@ class Qwen3_5DecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self.block_type == "linear_attention":
-            hidden_states = self.linear_attn(
-                hidden_states,
-                attention_mask=attention_mask,
-                layer_state=layer_state,
-            )
+            with profile_range("qwen35_deltanet_mixer"):
+                hidden_states = self.linear_attn(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    layer_state=layer_state,
+                )
         else:
-            hidden_states = self.self_attn(
-                hidden_states,
-                position_embeddings=position_embeddings,
-                attention_mask=attention_mask,
-            )
+            with profile_range("qwen35_full_attention_mixer"):
+                hidden_states = self.self_attn(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attention_mask,
+                )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        with profile_range("qwen35_mlp"):
+            hidden_states = self.mlp(hidden_states)
         return residual + hidden_states
 
 
