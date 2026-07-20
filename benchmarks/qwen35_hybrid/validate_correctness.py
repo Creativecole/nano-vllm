@@ -41,6 +41,11 @@ def parse_args():
     parser.add_argument("--atol", type=float, default=5e-2)
     parser.add_argument("--rtol", type=float, default=5e-2)
     parser.add_argument(
+        "--skip-continuous-batching",
+        action="store_true",
+        help="Skip the mixed-length dynamic-admission workload for staged spot checks.",
+    )
+    parser.add_argument(
         "--save-json",
         default=str(DEFAULT_RESULTS_DIR / "correctness.json"),
     )
@@ -164,24 +169,25 @@ def run_hf_worker(args, prompt_lens, batch_sizes, decode_steps):
                 ]
             del cache, outputs, logits
     payload["continuous_tokens"] = {}
-    for row, (prompt, steps) in enumerate(continuous_workload(config.vocab_size)):
-        input_ids = torch.tensor([prompt], device="cuda")
-        outputs = model(input_ids=input_ids, use_cache=True)
-        cache = outputs.past_key_values
-        logits = outputs.logits[:, -1]
-        tokens = []
-        for step in range(steps):
-            token = logits.argmax(-1)
-            tokens.append(int(token))
-            if step + 1 < steps:
-                outputs = model(
-                    input_ids=token.unsqueeze(1),
-                    past_key_values=cache,
-                    use_cache=True,
-                )
-                cache = outputs.past_key_values
-                logits = outputs.logits[:, -1]
-        payload["continuous_tokens"][str(row)] = tokens
+    if not args.skip_continuous_batching:
+        for row, (prompt, steps) in enumerate(continuous_workload(config.vocab_size)):
+            input_ids = torch.tensor([prompt], device="cuda")
+            outputs = model(input_ids=input_ids, use_cache=True)
+            cache = outputs.past_key_values
+            logits = outputs.logits[:, -1]
+            tokens = []
+            for step in range(steps):
+                token = logits.argmax(-1)
+                tokens.append(int(token))
+                if step + 1 < steps:
+                    outputs = model(
+                        input_ids=token.unsqueeze(1),
+                        past_key_values=cache,
+                        use_cache=True,
+                    )
+                    cache = outputs.past_key_values
+                    logits = outputs.logits[:, -1]
+            payload["continuous_tokens"][str(row)] = tokens
     return payload
 
 
@@ -271,36 +277,37 @@ def run_nano_serving_worker(args, prompt_lens, batch_sizes, decode_steps):
                         row[:steps] for row in rows
                     ]
 
-        workload = continuous_workload(int(facts["vocab_size"]))
-        first_ids = [
-            llm.add_request(
-                prompt,
-                SamplingParams(
-                    temperature=0.0, max_tokens=steps, ignore_eos=True
-                ),
-            )
-            for prompt, steps in workload[:2]
-        ]
-        generated = {seq_id: [] for seq_id in first_ids}
-        _, _, step_logits = llm.step_with_logits()
-        for seq_id, logits in step_logits.items():
-            generated[seq_id].append(int(logits.argmax()))
-        third_prompt, third_steps = workload[2]
-        third_id = llm.add_request(
-            third_prompt,
-            SamplingParams(
-                temperature=0.0,
-                max_tokens=third_steps,
-                ignore_eos=True,
-            ),
-        )
-        generated[third_id] = []
-        while not llm.is_finished():
+        if not args.skip_continuous_batching:
+            workload = continuous_workload(int(facts["vocab_size"]))
+            first_ids = [
+                llm.add_request(
+                    prompt,
+                    SamplingParams(
+                        temperature=0.0, max_tokens=steps, ignore_eos=True
+                    ),
+                )
+                for prompt, steps in workload[:2]
+            ]
+            generated = {seq_id: [] for seq_id in first_ids}
             _, _, step_logits = llm.step_with_logits()
             for seq_id, logits in step_logits.items():
                 generated[seq_id].append(int(logits.argmax()))
-        for row, seq_id in enumerate([*first_ids, third_id]):
-            payload["continuous_tokens"][str(row)] = generated[seq_id]
+            third_prompt, third_steps = workload[2]
+            third_id = llm.add_request(
+                third_prompt,
+                SamplingParams(
+                    temperature=0.0,
+                    max_tokens=third_steps,
+                    ignore_eos=True,
+                ),
+            )
+            generated[third_id] = []
+            while not llm.is_finished():
+                _, _, step_logits = llm.step_with_logits()
+                for seq_id, logits in step_logits.items():
+                    generated[seq_id].append(int(logits.argmax()))
+            for row, seq_id in enumerate([*first_ids, third_id]):
+                payload["continuous_tokens"][str(row)] = generated[seq_id]
     finally:
         llm.exit()
     return payload
@@ -339,6 +346,8 @@ def invoke_worker(args, worker: str, artifact: Path):
         "--artifact",
         str(artifact),
     ]
+    if args.skip_continuous_batching:
+        command.append("--skip-continuous-batching")
     print(f"[correctness] starting {worker}", flush=True)
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + environment.get(
