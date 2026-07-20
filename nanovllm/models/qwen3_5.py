@@ -4,6 +4,14 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from nanovllm.engine.layer_state import (
+    DeltaNetState,
+    DeltaNetStateSpec,
+    PagedKVState,
+    PagedKVStateSpec,
+)
+from nanovllm.utils.context import get_context
+
 
 def _config_value(config, name, default=None):
     value = getattr(config, name, default)
@@ -90,7 +98,10 @@ class Qwen3_5RotaryEmbedding(nn.Module):
         x: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+        flat_positions = position_ids.ndim == 1
+        if flat_positions:
+            position_ids = position_ids.view(1, 1, -1).expand(3, 1, -1)
+        elif position_ids.ndim == 3 and position_ids.shape[0] == 4:
             position_ids = position_ids[1:]
         elif position_ids.ndim == 2:
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
@@ -99,7 +110,9 @@ class Qwen3_5RotaryEmbedding(nn.Module):
                 "Qwen3.5 position_ids must have shape [batch, seq], [3, batch, seq], "
                 f"or [4, batch, seq], got {tuple(position_ids.shape)}"
             )
-        if position_ids.shape[1] != x.shape[0] or position_ids.shape[2] != x.shape[1]:
+        if not flat_positions and (
+            position_ids.shape[1] != x.shape[0] or position_ids.shape[2] != x.shape[1]
+        ):
             raise ValueError(
                 "position_ids batch/sequence dimensions must match the input: "
                 f"positions={tuple(position_ids.shape)}, input={tuple(x.shape)}"
@@ -109,7 +122,11 @@ class Qwen3_5RotaryEmbedding(nn.Module):
         freqs = position_ids.float().unsqueeze(-1) * self.inv_freq.float().view(1, 1, 1, -1)
         freqs = self._apply_interleaved_mrope(freqs)
         embeddings = torch.cat((freqs, freqs), dim=-1)
-        return embeddings.cos().to(x.dtype), embeddings.sin().to(x.dtype)
+        cos = embeddings.cos().to(x.dtype)
+        sin = embeddings.sin().to(x.dtype)
+        if flat_positions:
+            cos, sin = cos.squeeze(0), sin.squeeze(0)
+        return cos, sin
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -206,6 +223,23 @@ class Qwen3_5Attention(nn.Module):
         )
         self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.paged_attention = None
+
+    def enable_paged_attention(self) -> None:
+        from nanovllm.layers.attention import Attention
+
+        self.paged_attention = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            self.num_kv_heads,
+        )
+
+    def bind_paged_state(self, state: PagedKVState) -> None:
+        if self.paged_attention is None:
+            self.enable_paged_attention()
+        self.paged_attention.k_cache = state.k_cache
+        self.paged_attention.v_cache = state.v_cache
 
     def forward(
         self,
@@ -213,6 +247,32 @@ class Qwen3_5Attention(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if hidden_states.ndim == 2:
+            if self.paged_attention is None:
+                raise RuntimeError("Packed Qwen3.5 attention requires the paged serving backend")
+            num_tokens = hidden_states.shape[0]
+            query_and_gate = self.q_proj(hidden_states).view(
+                num_tokens, self.num_heads, self.head_dim * 2
+            )
+            query, gate = query_and_gate.chunk(2, dim=-1)
+            gate = gate.reshape(num_tokens, self.num_heads * self.head_dim)
+            query = self.q_norm(query)
+            key = self.k_norm(
+                self.k_proj(hidden_states).view(num_tokens, self.num_kv_heads, self.head_dim)
+            )
+            value = self.v_proj(hidden_states).view(
+                num_tokens, self.num_kv_heads, self.head_dim
+            )
+            query, key = apply_partial_rotary_pos_emb(
+                query, key, *position_embeddings
+            )
+            output = self.paged_attention(query, key, value)
+            if output.ndim == 4:
+                output = output.squeeze(1)
+            output = output.reshape(num_tokens, self.num_heads * self.head_dim)
+            output = output * torch.sigmoid(gate)
+            return self.o_proj(output)
+
         batch_size, seq_len, _ = hidden_states.shape
         query_and_gate = self.q_proj(hidden_states).view(
             batch_size,
@@ -348,12 +408,92 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
+    def _forward_stateful_chunk(
+        self,
+        hidden_states: torch.Tensor,
+        layer_state: DeltaNetState,
+    ) -> torch.Tensor:
+        # hidden_states: [batch, seq_len, hidden_size]
+        batch_size, seq_len, _ = hidden_states.shape
+        raw_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        conv_input = torch.cat(
+            (layer_state.conv_state[:, :, 1:], raw_qkv), dim=-1
+        )
+        mixed_qkv = F.silu(
+            F.conv1d(
+                conv_input,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                groups=self.conv_dim,
+            )
+        ).transpose(1, 2)
+        new_conv_state = torch.cat((layer_state.conv_state, raw_qkv), dim=-1)[
+            :, :, -self.conv_kernel_size :
+        ]
+        layer_state.conv_state.copy_(new_conv_state)
+
+        query, key, value = mixed_qkv.split(
+            (self.key_dim, self.key_dim, self.value_dim), dim=-1
+        )
+        query = query.view(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        key = key.view(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        value = value.view(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+        repeats = self.num_v_heads // self.num_k_heads
+        query = query.repeat_interleave(repeats, dim=2)
+        key = key.repeat_interleave(repeats, dim=2)
+        beta = torch.sigmoid(self.in_proj_b(hidden_states))
+        decay = -self.A_log.float().exp() * F.softplus(
+            self.in_proj_a(hidden_states).float() + self.dt_bias.float()
+        )
+        core_output, final_state = gated_delta_rule_reference(
+            query,
+            key,
+            value,
+            decay,
+            beta,
+            initial_state=layer_state.recurrent_state,
+        )
+        layer_state.recurrent_state.copy_(final_state)
+        z = self.in_proj_z(hidden_states).view(
+            batch_size, seq_len, self.num_v_heads, self.head_v_dim
+        )
+        output = self.norm(core_output, z).reshape(batch_size, seq_len, self.value_dim)
+        return self.out_proj(output)
+
+    def _forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        layer_state: DeltaNetState,
+    ) -> torch.Tensor:
+        context = get_context()
+        if context.is_prefill:
+            if context.prefill_seq_lens is None:
+                raise RuntimeError("Packed prefill is missing sequence lengths")
+            chunks = hidden_states.split(context.prefill_seq_lens, dim=0)
+            outputs = []
+            for batch_idx, chunk in enumerate(chunks):
+                request_state = DeltaNetState(
+                    layer_idx=self.layer_idx,
+                    conv_state=layer_state.conv_state[batch_idx : batch_idx + 1],
+                    recurrent_state=layer_state.recurrent_state[batch_idx : batch_idx + 1],
+                )
+                output = self._forward_stateful_chunk(chunk.unsqueeze(0), request_state)
+                outputs.append(output.squeeze(0))
+            return torch.cat(outputs, dim=0)
+        output = self._forward_stateful_chunk(hidden_states.unsqueeze(1), layer_state)
+        return output.squeeze(1)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         return_state: bool = False,
+        layer_state: DeltaNetState | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if layer_state is not None:
+            if hidden_states.ndim != 2:
+                raise ValueError("Stateful DeltaNet expects packed/decode rank-2 hidden states")
+            return self._forward_packed(hidden_states, layer_state)
         # hidden_states: [batch, seq_len, hidden_size]
         if attention_mask is not None and attention_mask.ndim == 2:
             hidden_states = hidden_states * attention_mask.to(hidden_states.dtype).unsqueeze(-1)
@@ -434,11 +574,16 @@ class Qwen3_5DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
+        layer_state: DeltaNetState | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         if self.block_type == "linear_attention":
-            hidden_states = self.linear_attn(hidden_states, attention_mask=attention_mask)
+            hidden_states = self.linear_attn(
+                hidden_states,
+                attention_mask=attention_mask,
+                layer_state=layer_state,
+            )
         else:
             hidden_states = self.self_attn(
                 hidden_states,
@@ -501,7 +646,23 @@ class Qwen3_5Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        layer_states: dict[int, DeltaNetState] | None = None,
     ) -> torch.Tensor:
+        if layer_states is not None:
+            if input_ids.ndim != 1 or positions is None or positions.ndim != 1:
+                raise ValueError(
+                    "Stateful Qwen3.5 serving expects rank-1 packed input_ids and positions"
+                )
+            hidden_states = self.embed_tokens(input_ids)
+            position_embeddings = self.rotary_emb(hidden_states, positions)
+            for layer in self.layers:
+                hidden_states = layer(
+                    hidden_states,
+                    position_embeddings=position_embeddings,
+                    layer_state=layer_states.get(layer.layer_idx),
+                )
+            return self.norm(hidden_states)
+
         squeeze_batch = input_ids.ndim == 1
         if squeeze_batch:
             input_ids = input_ids.unsqueeze(0)
@@ -522,7 +683,9 @@ class Qwen3_5Model(nn.Module):
 
 
 class Qwen3_5ForCausalLM(nn.Module):
-    supports_stateful_serving = False
+    supports_stateful_serving = True
+    supports_prefix_cache = False
+    supports_cuda_graph = False
     packed_modules_mapping = {}
     checkpoint_prefix_mapping = (
         ("model.language_model.", "model."),
@@ -553,11 +716,55 @@ class Qwen3_5ForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        layer_states: dict[int, DeltaNetState] | None = None,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions, attention_mask)
+        return self.model(input_ids, positions, attention_mask, layer_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        context = get_context()
+        if context.is_prefill and hidden_states.ndim == 2:
+            hidden_states = hidden_states[context.cu_seqlens_q[1:] - 1].contiguous()
         return self.lm_head(hidden_states)
+
+    def get_layer_state_specs(self) -> list[PagedKVStateSpec | DeltaNetStateSpec]:
+        parameter_dtype = self.model.embed_tokens.weight.dtype
+        specs = []
+        for layer in self.model.layers:
+            if layer.block_type == "full_attention":
+                specs.append(
+                    PagedKVStateSpec(
+                        layer_idx=layer.layer_idx,
+                        layer_type=layer.block_type,
+                        num_kv_heads=layer.self_attn.num_kv_heads,
+                        head_dim=layer.self_attn.head_dim,
+                        dtype=parameter_dtype,
+                    )
+                )
+            else:
+                mixer = layer.linear_attn
+                specs.append(
+                    DeltaNetStateSpec(
+                        layer_idx=layer.layer_idx,
+                        layer_type=layer.block_type,
+                        conv_dim=mixer.conv_dim,
+                        conv_width=mixer.conv_kernel_size,
+                        num_value_heads=mixer.num_v_heads,
+                        key_head_dim=mixer.head_k_dim,
+                        value_head_dim=mixer.head_v_dim,
+                        conv_dtype=parameter_dtype,
+                    )
+                )
+        return specs
+
+    def enable_paged_attention(self) -> None:
+        for layer in self.model.layers:
+            if layer.block_type == "full_attention":
+                layer.self_attn.enable_paged_attention()
+
+    def bind_paged_kv_states(self, states: dict[int, PagedKVState]) -> None:
+        for layer in self.model.layers:
+            if layer.block_type == "full_attention":
+                layer.self_attn.bind_paged_state(states[layer.layer_idx])
 
     def forward_logits(
         self,

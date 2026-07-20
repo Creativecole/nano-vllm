@@ -1,6 +1,9 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
+
+from nanovllm.utils.context import get_context
 
 
 def tiny_qwen35_kwargs(layer_types=None, tie_word_embeddings=False):
@@ -80,3 +83,79 @@ def use_transformers_recurrent_reference(modeling, linear_attention):
         )
 
     linear_attention.chunk_gated_delta_rule = recurrent_chunk
+
+
+class TorchPagedAttentionReference(torch.nn.Module):
+    def __init__(self, num_blocks, block_size, num_q_heads, num_kv_heads, head_dim, scale):
+        super().__init__()
+        self.block_size = block_size
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.scale = scale
+        self.k_cache = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim)
+        self.v_cache = torch.zeros_like(self.k_cache)
+
+    def _store(self, key, value, slots):
+        slots = slots.long()
+        valid = slots >= 0
+        self.k_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
+            0, slots[valid], key[valid]
+        )
+        self.v_cache.view(-1, self.num_kv_heads, self.head_dim).index_copy_(
+            0, slots[valid], value[valid]
+        )
+
+    def _gather_cache(self, block_table, context_len):
+        positions = torch.arange(context_len)
+        blocks = block_table[positions // self.block_size].long()
+        offsets = positions % self.block_size
+        return self.k_cache[blocks, offsets], self.v_cache[blocks, offsets]
+
+    def _attend(self, query, key, value, query_start):
+        repeats = self.num_q_heads // self.num_kv_heads
+        key = key.repeat_interleave(repeats, dim=1)
+        value = value.repeat_interleave(repeats, dim=1)
+        scores = torch.einsum("qhd,khd->hqk", query, key) * self.scale
+        q_positions = torch.arange(query.shape[0]) + query_start
+        k_positions = torch.arange(key.shape[0])
+        scores = scores.masked_fill(
+            k_positions.view(1, 1, -1) > q_positions.view(1, -1, 1),
+            float("-inf"),
+        )
+        probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(query.dtype)
+        return torch.einsum("hqk,khd->qhd", probabilities, value)
+
+    def forward(self, query, key, value):
+        context = get_context()
+        self._store(key, value, context.slot_mapping)
+        outputs = []
+        if context.is_prefill:
+            q_offsets = context.cu_seqlens_q.tolist()
+            k_offsets = context.cu_seqlens_k.tolist()
+            for row in range(len(q_offsets) - 1):
+                q_start, q_end = q_offsets[row], q_offsets[row + 1]
+                context_len = k_offsets[row + 1] - k_offsets[row]
+                if context.block_tables is None:
+                    key_row = key[q_start:q_end]
+                    value_row = value[q_start:q_end]
+                else:
+                    key_row, value_row = self._gather_cache(
+                        context.block_tables[row], context_len
+                    )
+                outputs.append(
+                    self._attend(
+                        query[q_start:q_end],
+                        key_row,
+                        value_row,
+                        context_len - (q_end - q_start),
+                    )
+                )
+            return torch.cat(outputs, dim=0)
+
+        for row, context_len in enumerate(context.context_lens.tolist()):
+            key_row, value_row = self._gather_cache(context.block_tables[row], context_len)
+            outputs.append(
+                self._attend(query[row : row + 1], key_row, value_row, context_len - 1)
+            )
+        return torch.stack(outputs, dim=0)

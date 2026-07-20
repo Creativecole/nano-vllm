@@ -6,6 +6,13 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.layer_state import (
+    DeltaNetStateSpec,
+    HybridStateManager,
+    PagedKVState,
+    delta_state_bytes_per_sequence,
+    paged_kv_bytes_per_block,
+)
 from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -24,11 +31,12 @@ class ModelRunner:
         self.event = event
 
         model_class = get_model_class(config.hf_config, hf_config)
-        if not getattr(model_class, "supports_stateful_serving", True):
-            raise NotImplementedError(
-                f"{model_class.__name__} is available for no-cache Phase 1 validation; "
-                "hybrid recurrent-state serving is added in Phase 2."
-            )
+        if not getattr(model_class, "supports_cuda_graph", True):
+            self.enforce_eager = True
+            config.enforce_eager = True
+        config.enable_prefix_cache = config.enable_prefix_cache and bool(
+            getattr(model_class, "supports_prefix_cache", True)
+        )
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -38,8 +46,19 @@ class ModelRunner:
         self.model = model_class(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
+        get_specs = getattr(self.model, "get_layer_state_specs", None)
+        self.layer_state_specs = get_specs() if get_specs is not None else []
+        self.is_hybrid = any(
+            isinstance(spec, DeltaNetStateSpec) for spec in self.layer_state_specs
+        )
+        self.hybrid_state_manager = None
+        if self.is_hybrid:
+            if self.world_size != 1:
+                raise NotImplementedError("Qwen3.5 hybrid serving currently supports TP=1")
+            self.allocate_hybrid_cache()
+        else:
+            self.warmup_model()
+            self.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -134,6 +153,84 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
+    def allocate_hybrid_cache(self):
+        config = self.config
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        available = int(total * config.gpu_memory_utilization - used - peak + current)
+        state_bytes = delta_state_bytes_per_sequence(self.layer_state_specs)
+        block_bytes = paged_kv_bytes_per_block(
+            self.layer_state_specs, self.block_size
+        )
+        if state_bytes <= 0 or block_bytes <= 0:
+            raise RuntimeError(
+                "Hybrid serving requires both DeltaNet state and full-attention KV layers"
+            )
+
+        if config.hybrid_state_capacity:
+            state_capacity = min(config.max_num_seqs, config.hybrid_state_capacity)
+        else:
+            state_budget = int(available * config.hybrid_state_memory_fraction)
+            state_capacity = min(
+                config.max_num_seqs,
+                max(1, state_budget // state_bytes),
+            )
+        reserved_state_bytes = state_capacity * state_bytes
+        num_blocks = (available - reserved_state_bytes) // block_bytes
+        if num_blocks <= 0:
+            raise RuntimeError(
+                "Insufficient GPU memory after reserving DeltaNet request states: "
+                f"available={available}, state_capacity={state_capacity}, "
+                f"state_bytes_per_sequence={state_bytes}, kv_block_bytes={block_bytes}"
+            )
+
+        delta_specs = [
+            spec
+            for spec in self.layer_state_specs
+            if isinstance(spec, DeltaNetStateSpec)
+        ]
+        self.hybrid_state_manager = HybridStateManager(
+            delta_specs,
+            capacity=state_capacity,
+            device=torch.device("cuda", self.rank),
+        )
+        paged_states = {}
+        for spec in self.layer_state_specs:
+            if isinstance(spec, DeltaNetStateSpec):
+                continue
+            paged_states[spec.layer_idx] = PagedKVState(
+                layer_idx=spec.layer_idx,
+                k_cache=torch.empty(
+                    num_blocks,
+                    self.block_size,
+                    spec.num_kv_heads,
+                    spec.head_dim,
+                    dtype=spec.dtype,
+                    device=torch.device("cuda", self.rank),
+                ),
+                v_cache=torch.empty(
+                    num_blocks,
+                    self.block_size,
+                    spec.num_kv_heads,
+                    spec.head_dim,
+                    dtype=spec.dtype,
+                    device=torch.device("cuda", self.rank),
+                ),
+            )
+        self.model.enable_paged_attention()
+        self.model.bind_paged_kv_states(paged_states)
+        config.max_num_seqs = min(config.max_num_seqs, state_capacity)
+        config.num_kvcache_blocks = int(num_blocks)
+        print(
+            "Hybrid cache: "
+            f"state_slots={state_capacity}, state_bytes_per_sequence={state_bytes}, "
+            f"kv_blocks={num_blocks}, full_attention_layers={len(paged_states)}, "
+            f"deltanet_layers={len(delta_specs)}",
+            flush=True,
+        )
+
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
@@ -180,7 +277,18 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        prefill_seq_lens = tuple(seq.num_scheduled_tokens for seq in seqs)
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            None,
+            block_tables,
+            prefill_seq_lens,
+        )
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -207,7 +315,16 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_model(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        is_prefill: bool,
+        layer_states=None,
+    ):
+        if layer_states is not None:
+            hidden_states = self.model(input_ids, positions, layer_states=layer_states)
+            return self.model.compute_logits(hidden_states)
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
@@ -228,10 +345,30 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        layer_states = None
+        if self.hybrid_state_manager is not None:
+            seq_ids = [seq.seq_id for seq in seqs]
+            self.hybrid_state_manager.allocate(seq_ids)
+            layer_states = self.hybrid_state_manager.gather(seq_ids)
+        logits = self.run_model(input_ids, positions, is_prefill, layer_states)
+        if layer_states is not None:
+            self.hybrid_state_manager.commit(layer_states)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
+
+    def release_states(self, seq_ids: list[int]):
+        if self.hybrid_state_manager is not None:
+            self.hybrid_state_manager.free(seq_ids)
+
+    def get_hybrid_state_stats(self):
+        if self.hybrid_state_manager is None:
+            return None
+        return {
+            "capacity": self.hybrid_state_manager.capacity,
+            "allocated": self.hybrid_state_manager.allocated_count,
+            "free": self.hybrid_state_manager.free_count,
+        }
 
     @torch.inference_mode()
     def capture_cudagraph(self):

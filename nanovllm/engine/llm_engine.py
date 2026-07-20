@@ -32,9 +32,13 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self._exited = False
         atexit.register(self.exit)
 
     def exit(self):
+        if self._exited:
+            return
+        self._exited = True
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -48,9 +52,15 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        released_seq_ids = self.scheduler.drain_released_seq_ids()
+        if released_seq_ids:
+            self.model_runner.call("release_states", released_seq_ids)
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        released_seq_ids = self.scheduler.drain_released_seq_ids()
+        if released_seq_ids:
+            self.model_runner.call("release_states", released_seq_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 

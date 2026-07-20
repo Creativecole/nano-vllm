@@ -51,6 +51,9 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    hybrid_state_capacity: int = 0
+    hybrid_state_memory_fraction: float = 0.1
+    enable_prefix_cache: bool = True
     hf_config: object | None = None
     hf_text_config: object | None = None
     dtype: torch.dtype | None = None
@@ -62,6 +65,8 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        assert self.hybrid_state_capacity >= 0
+        assert 0 < self.hybrid_state_memory_fraction < 1
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.hf_text_config = get_hf_text_config(self.hf_config)
         dtype_value = self.dtype
