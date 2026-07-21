@@ -28,6 +28,12 @@ def parse_args():
     parser.add_argument("--decode-steps", type=int, required=True)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument(
+        "--deltanet-backend",
+        choices=("sequential", "chunked"),
+        default="sequential",
+    )
+    parser.add_argument("--deltanet-chunk-size", type=int, default=64)
+    parser.add_argument(
         "--output",
         help="Output prefix without .nsys-rep/.ncu-rep; a descriptive default is used.",
     )
@@ -58,6 +64,10 @@ def target_command(args) -> list[str]:
         str(args.decode_steps),
         "--warmup",
         str(args.warmup),
+        "--deltanet-backend",
+        args.deltanet_backend,
+        "--deltanet-chunk-size",
+        str(args.deltanet_chunk_size),
     ]
 
 
@@ -66,7 +76,7 @@ def output_prefix(args) -> Path:
         return Path(args.output)
     label = (
         f"qwen35_{args.phase}_b{args.batch_size}_p{args.prompt_len}"
-        f"_d{args.decode_steps}_{args.tool}"
+        f"_d{args.decode_steps}_{args.deltanet_backend}_{args.tool}"
     )
     return DEFAULT_RESULTS_DIR / label
 
@@ -112,6 +122,8 @@ def build_command(args) -> list[str]:
 
 def main():
     args = parse_args()
+    if args.deltanet_chunk_size <= 0:
+        raise ValueError("--deltanet-chunk-size must be positive")
     command = build_command(args)
     print(shlex.join(command), flush=True)
     if args.dry_run:

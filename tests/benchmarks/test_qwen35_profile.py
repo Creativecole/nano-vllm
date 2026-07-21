@@ -10,7 +10,7 @@ from benchmarks.qwen35_hybrid.profile_serving import (
     summarize_profile,
 )
 from benchmarks.qwen35_hybrid.common import write_json
-from benchmarks.qwen35_hybrid.run_nsight import build_command
+from benchmarks.qwen35_hybrid.run_nsight import build_command, output_prefix
 from benchmarks.qwen35_hybrid.profile_layers import (
     compare_deltanet_profiles,
     resolve_layer_ids,
@@ -133,6 +133,8 @@ def _nsight_args(tool, kernel_name=None):
         prompt_len=512,
         decode_steps=32,
         warmup=1,
+        deltanet_backend="chunked",
+        deltanet_chunk_size=64,
         output="/tmp/qwen35_profile",
         kernel_name=kernel_name,
         launch_skip=2,
@@ -144,11 +146,20 @@ def test_nsight_commands_target_one_reproducible_case():
     nsys = build_command(_nsight_args("nsys"))
     assert nsys[:2] == ["nsys", "profile"]
     assert "--target-only" in nsys
+    assert nsys[nsys.index("--deltanet-backend") + 1] == "chunked"
+    assert nsys[nsys.index("--deltanet-chunk-size") + 1] == "64"
     ncu = build_command(_nsight_args("ncu", "gated_delta.*"))
     assert ncu[0] == "ncu"
     assert "regex:gated_delta.*" in ncu
+    assert ncu[ncu.index("--deltanet-backend") + 1] == "chunked"
     with pytest.raises(ValueError, match="kernel-name"):
         build_command(_nsight_args("ncu"))
+
+
+def test_nsight_default_output_prefix_includes_deltanet_backend():
+    args = _nsight_args("nsys")
+    args.output = None
+    assert output_prefix(args).name.endswith("_chunked_nsys")
 
 
 def _profile_args(path):

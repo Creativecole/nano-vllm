@@ -100,5 +100,5 @@ TTFT is the primary expected benefit because the new backend changes prefill. De
 throughput is retained as a regression check, and peak memory makes the chunked
 algorithm's temporary-storage tradeoff visible.
 
-No chunked performance result is recorded here until the commands above complete on
-the RTX 5090.
+The completed RTX 5090 results and the Nsight Systems follow-up are summarized in
+`07_chunked_recurrence_final.md`.
