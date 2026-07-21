@@ -26,18 +26,20 @@ runtime was verified to use `causal_conv1d_fn` and FLA
 
 ### End-to-End Serving
 
-| Batch | Prompt | HF TTFT | nano-vLLM TTFT | HF decode tok/s | nano-vLLM decode tok/s |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 128 | 176.7 ms | **169.9 ms** | 20.93 | **24.15** |
-| 1 | 512 | 214.5 ms | **200.5 ms** | 20.87 | **24.37** |
-| 1 | 2048 | 360.6 ms | **331.4 ms** | 20.84 | **24.25** |
-| 4 | 128 | 181.5 ms | **175.3 ms** | 82.24 | **95.28** |
-| 4 | 512 | 240.8 ms | **235.0 ms** | 81.90 | **94.93** |
-| 4 | 2048 | 999.5 ms | **952.2 ms** | 81.88 | **94.92** |
+| Batch | Prompt | HF TTFT | nano TTFT | HF avg ITL | nano avg ITL | HF decode tok/s | nano decode tok/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 128 | 176.7 ms | **169.9 ms** | 47.78 ms | **41.41 ms** | 20.93 | **24.15** |
+| 1 | 512 | 214.5 ms | **200.5 ms** | 47.91 ms | **41.04 ms** | 20.87 | **24.37** |
+| 1 | 2048 | 360.6 ms | **331.4 ms** | 47.99 ms | **41.24 ms** | 20.84 | **24.25** |
+| 4 | 128 | 181.5 ms | **175.3 ms** | 48.64 ms | **41.98 ms** | 82.24 | **95.28** |
+| 4 | 512 | 240.8 ms | **235.0 ms** | 48.84 ms | **42.14 ms** | 81.90 | **94.93** |
+| 4 | 2048 | 999.5 ms | **952.2 ms** | 48.85 ms | **42.14 ms** | 81.88 | **94.92** |
 
 On this matrix, nano-vLLM is 2.4% to 8.1% lower in TTFT and about 16% higher in
 aggregate decode throughput than the measured HF eager baseline. These are runtime
 results for this exact model, GPU, and workload, not general claims across hardware.
+ITL is average inter-token latency, while decode tok/s is aggregate throughput across
+the batch; the batch-4 throughput is not per-request generation speed.
 
 ### Batched Prefill Optimization
 
