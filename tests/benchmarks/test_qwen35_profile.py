@@ -5,8 +5,11 @@ import pytest
 from benchmarks.qwen35_hybrid.profile_serving import (
     derive_answers,
     kernel_category,
+    load_checkpoint,
+    matrix_spec,
     summarize_profile,
 )
+from benchmarks.qwen35_hybrid.common import write_json
 from benchmarks.qwen35_hybrid.run_nsight import build_command
 
 
@@ -141,3 +144,52 @@ def test_nsight_commands_target_one_reproducible_case():
     assert "regex:gated_delta.*" in ncu
     with pytest.raises(ValueError, match="kernel-name"):
         build_command(_nsight_args("ncu"))
+
+
+def _profile_args(path):
+    return Namespace(
+        model="/models/Qwen3.5-9B",
+        batch_sizes="1,4",
+        prompt_lens="128",
+        decode_steps="32",
+        phases="prefill,decode",
+        warmup=1,
+        record_shapes=True,
+        profile_memory=False,
+        no_resume=False,
+        save_json=str(path),
+    )
+
+
+def test_profile_checkpoint_resumes_only_an_identical_matrix(tmp_path):
+    path = tmp_path / "profile.json"
+    args = _profile_args(path)
+    spec = matrix_spec(args)
+    row = {
+        "batch_size": 1,
+        "prompt_len": 128,
+        "decode_steps": 32,
+        "phase": "prefill",
+    }
+    write_json(
+        path,
+        {
+            "schema_version": 1,
+            "environment": {"model": args.model},
+            "matrix": spec,
+            "profiles": [row],
+        },
+    )
+    assert load_checkpoint(args, spec) == [row]
+
+    args.warmup = 2
+    with pytest.raises(RuntimeError, match="different model or matrix"):
+        load_checkpoint(args, matrix_spec(args))
+
+
+def test_no_resume_ignores_existing_checkpoint(tmp_path):
+    path = tmp_path / "profile.json"
+    path.write_text("not json")
+    args = _profile_args(path)
+    args.no_resume = True
+    assert load_checkpoint(args, matrix_spec(args)) == []

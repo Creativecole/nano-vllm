@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -69,6 +70,11 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--record-shapes", action="store_true")
     parser.add_argument("--profile-memory", action="store_true")
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Start a fresh matrix instead of resuming a compatible JSON checkpoint.",
+    )
     parser.add_argument(
         "--trace-dir",
         default=str(DEFAULT_RESULTS_DIR / "traces"),
@@ -345,7 +351,87 @@ def run_profile_case(llm, facts, case, phase, trace_path, args):
     return summarize_profile(prof, wall_time_s)
 
 
-def profile_matrix(args):
+def matrix_spec(args):
+    return {
+        "batch_sizes": parse_int_list(args.batch_sizes),
+        "prompt_lens": parse_int_list(args.prompt_lens),
+        "decode_steps": parse_int_list(args.decode_steps),
+        "phases": [item.strip() for item in args.phases.split(",") if item.strip()],
+        "warmup": args.warmup,
+        "record_shapes": args.record_shapes,
+        "profile_memory": args.profile_memory,
+    }
+
+
+def case_key(item):
+    return (
+        int(item["batch_size"]),
+        int(item["prompt_len"]),
+        int(item["decode_steps"]),
+        str(item["phase"]),
+    )
+
+
+def load_checkpoint(args, spec):
+    path = Path(args.save_json)
+    if args.no_resume or not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Cannot resume invalid checkpoint {path}: {exc}. "
+            "Use --no-resume to replace it."
+        ) from exc
+    if payload.get("schema_version") != 1:
+        raise RuntimeError(
+            f"Checkpoint {path} has an unsupported schema. Use --no-resume."
+        )
+    saved_model = payload.get("environment", {}).get("model")
+    if saved_model != args.model or payload.get("matrix") != spec:
+        raise RuntimeError(
+            f"Checkpoint {path} belongs to a different model or matrix. "
+            "Use another --save-json path or pass --no-resume."
+        )
+    rows = payload.get("profiles", [])
+    unique = {}
+    for row in rows:
+        unique[case_key(row)] = row
+    print(f"[resume] loaded {len(unique)} completed cases from {path}", flush=True)
+    return list(unique.values())
+
+
+def build_payload(args, facts, spec, rows, failures):
+    expected_cases = (
+        len(spec["batch_sizes"])
+        * len(spec["prompt_lens"])
+        * len(spec["decode_steps"])
+        * len(spec["phases"])
+    )
+    return {
+        "schema_version": 1,
+        "environment": environment_metadata(args.model),
+        "model_facts": facts,
+        "matrix": spec,
+        "completed_cases": len(rows),
+        "expected_cases": expected_cases,
+        "profiles": sorted(rows, key=case_key),
+        "answers": derive_answers(rows),
+        "failures": failures,
+    }
+
+
+def save_checkpoint(args, facts, spec, rows, failures):
+    payload = build_payload(args, facts, spec, rows, failures)
+    write_json(args.save_json, payload)
+    write_text(args.save_md, render_markdown(payload))
+    print(
+        f"[checkpoint] {len(rows)} completed -> {args.save_json}",
+        flush=True,
+    )
+
+
+def profile_matrix(args, facts, spec, rows):
     require_cuda()
     os.environ["NANOVLLM_PROFILE_RANGES"] = "1"
     from nanovllm import LLM
@@ -353,14 +439,18 @@ def profile_matrix(args):
 
     configure_profile_ranges(torch_ranges=True)
 
-    facts = load_model_facts(args.model)
-    batch_sizes = parse_int_list(args.batch_sizes)
-    prompt_lens = parse_int_list(args.prompt_lens)
-    decode_steps = parse_int_list(args.decode_steps)
-    phases = [item.strip() for item in args.phases.split(",") if item.strip()]
+    batch_sizes = spec["batch_sizes"]
+    prompt_lens = spec["prompt_lens"]
+    decode_steps = spec["decode_steps"]
+    phases = spec["phases"]
     invalid = set(phases) - {"prefill", "decode", "continuous"}
     if invalid:
         raise ValueError(f"Unsupported phases: {sorted(invalid)}")
+    completed = {case_key(row) for row in rows}
+    expected = len(batch_sizes) * len(prompt_lens) * len(decode_steps) * len(phases)
+    if len(completed) == expected:
+        print(f"[resume] all {expected} cases are already complete", flush=True)
+        return rows, []
     llm = LLM(
         args.model,
         enforce_eager=True,
@@ -369,7 +459,6 @@ def profile_matrix(args):
         max_model_len=max(prompt_lens) + max(decode_steps) + 1,
         max_num_batched_tokens=max(batch_sizes) * max(prompt_lens),
     )
-    rows = []
     failures = []
     trace_dir = Path(args.trace_dir)
     try:
@@ -380,6 +469,10 @@ def profile_matrix(args):
                     for phase in phases:
                         label = f"b{batch_size}_p{prompt_len}_d{decode}_{phase}"
                         trace_path = trace_dir / f"{label}.json"
+                        key = (batch_size, prompt_len, decode, phase)
+                        if key in completed:
+                            print(f"[profile] SKIP completed {label}", flush=True)
+                            continue
                         print(f"[profile] {label}", flush=True)
                         try:
                             summary = run_profile_case(
@@ -395,6 +488,8 @@ def profile_matrix(args):
                                     **summary,
                                 }
                             )
+                            completed.add(key)
+                            save_checkpoint(args, facts, spec, rows, failures)
                         except Exception as exc:
                             failures.append(
                                 {
@@ -406,10 +501,11 @@ def profile_matrix(args):
                                 }
                             )
                             print(f"[profile] FAILED {label}: {exc}", flush=True)
-                            return rows, failures, facts
+                            save_checkpoint(args, facts, spec, rows, failures)
+                            return rows, failures
     finally:
         llm.exit()
-    return rows, failures, facts
+    return rows, failures
 
 
 def run_target(args):
@@ -752,6 +848,8 @@ def render_markdown(payload):
     failure_text = "None." if not failures else "\n".join(f"- {item}" for item in failures)
     return f"""# Qwen3.5 Hybrid Serving Profile Analysis
 
+Completed cases: `{payload.get('completed_cases', len(payload['profiles']))}` / `{payload.get('expected_cases', len(payload['profiles']))}`.
+
 This report separates additive CUDA kernel self-time from high-level operator/range
 attribution. Range percentages describe model components and may contain child kernels;
 kernel category percentages use CUDA device events and are the better low-level target
@@ -816,23 +914,14 @@ def main():
     if args.target_only:
         run_target(args)
         return
-    rows, failures, facts = profile_matrix(args)
-    payload = {
-        "environment": environment_metadata(args.model),
-        "model_facts": facts,
-        "matrix": {
-            "batch_sizes": parse_int_list(args.batch_sizes),
-            "prompt_lens": parse_int_list(args.prompt_lens),
-            "decode_steps": parse_int_list(args.decode_steps),
-            "phases": [item.strip() for item in args.phases.split(",") if item.strip()],
-            "warmup": args.warmup,
-        },
-        "profiles": rows,
-        "answers": derive_answers(rows),
-        "failures": failures,
-    }
-    write_json(args.save_json, payload)
-    write_text(args.save_md, render_markdown(payload))
+    spec = matrix_spec(args)
+    invalid = set(spec["phases"]) - {"prefill", "decode", "continuous"}
+    if invalid:
+        raise ValueError(f"Unsupported phases: {sorted(invalid)}")
+    facts = load_model_facts(args.model)
+    rows = load_checkpoint(args, spec)
+    rows, failures = profile_matrix(args, facts, spec, rows)
+    save_checkpoint(args, facts, spec, rows, failures)
     print(f"Saved {args.save_json}", flush=True)
     print(f"Saved {args.save_md}", flush=True)
 

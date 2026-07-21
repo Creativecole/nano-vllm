@@ -38,6 +38,12 @@ python benchmarks/qwen35_hybrid/profile_serving.py \
 This produces 54 Chrome traces under
 `benchmarks/qwen35_hybrid/results/traces/`, the machine-readable
 `profile_analysis.json`, and overwrites this document with the measured summary.
+Each completed configuration is atomically checkpointed to JSON and Markdown. If the
+SSH session or profiler process stops, rerun the same command: compatible completed
+cases are loaded and skipped automatically. Use `--no-resume` only when intentionally
+replacing the existing checkpoint; use a different `--save-json`/`--save-md` pair for
+a different matrix.
+
 For a quick environment check, first run one shape:
 
 ```bash

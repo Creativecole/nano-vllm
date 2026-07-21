@@ -14,3 +14,7 @@ Expected Phase 5 outputs:
 The generated human-readable summary is
 `docs/qwen35_hybrid/05_profile_analysis.md`. Large raw traces should be archived for
 analysis and do not need to be committed to Git.
+
+`profile_analysis.json` and the Markdown summary are atomically updated after every
+completed case. Re-running an identical command resumes the matrix and skips completed
+case keys; a different matrix must use another output path or `--no-resume`.

@@ -54,13 +54,22 @@ def summarize(values: Iterable[float | None]) -> dict[str, float | None]:
 def write_json(path: str | Path, payload) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    _atomic_write(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def write_text(path: str | Path, text: str) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text.rstrip() + "\n")
+    _atomic_write(path, text.rstrip() + "\n")
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(content)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def markdown_table(headers: list[str], rows: list[list[object]]) -> str:
