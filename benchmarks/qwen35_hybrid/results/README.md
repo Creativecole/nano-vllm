@@ -7,6 +7,7 @@ produced by an actual model run.
 Expected Phase 5 outputs:
 
 - `profile_analysis.json`: full PyTorch Profiler matrix and derived attribution.
+- `layer_profile.json`: isolated Full Attention versus DeltaNet serving-prefill layers.
 - `traces/*.json`: raw Chrome traces for prefill, decode, and continuous batching.
 - `nsight/*.nsys-rep`: selected Nsight Systems timelines.
 - `nsight/*.ncu-rep`: one or two profiler-selected Nsight Compute kernel reports.

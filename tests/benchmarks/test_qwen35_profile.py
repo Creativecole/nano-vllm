@@ -11,6 +11,10 @@ from benchmarks.qwen35_hybrid.profile_serving import (
 )
 from benchmarks.qwen35_hybrid.common import write_json
 from benchmarks.qwen35_hybrid.run_nsight import build_command
+from benchmarks.qwen35_hybrid.profile_layers import (
+    resolve_layer_ids,
+    summarize_layer_profile,
+)
 
 
 class FakeEvent:
@@ -193,3 +197,51 @@ def test_no_resume_ignores_existing_checkpoint(tmp_path):
     args = _profile_args(path)
     args.no_resume = True
     assert load_checkpoint(args, matrix_spec(args)) == []
+
+
+def test_layer_profiler_selects_first_layer_of_each_hybrid_type():
+    layer_types = [
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+    ]
+    assert resolve_layer_ids(layer_types, None) == [0, 3]
+    assert resolve_layer_ids(layer_types, [3, 0, 3]) == [3, 0]
+    with pytest.raises(ValueError, match="out of range"):
+        resolve_layer_ids(layer_types, [4])
+
+
+def test_layer_profile_counts_only_positive_duration_cuda_events():
+    profile = FakeProfile(
+        events=[
+            FakeEvent(
+                "elementwise_kernel",
+                device_type="DeviceType.CUDA",
+                device_us=100.0,
+                count=1,
+            ),
+            FakeEvent(
+                "memory_event",
+                device_type="DeviceType.CUDA",
+                device_us=0.0,
+                count=9,
+            ),
+        ],
+        averages=[
+            FakeEvent(
+                "qwen35_deltanet_recurrence",
+                device_us=100.0,
+                cpu_us=200.0,
+                self_cpu_us=20.0,
+                count=1,
+            )
+        ],
+    )
+    summary = summarize_layer_profile(profile, repeat=1, wall_time_s=0.001)
+    assert summary["kernel_count"] == 1
+    assert summary["cuda_time_ms"] == pytest.approx(0.1)
+    assert summary["kernel_families"]["elementwise"]["calls"] == 1
+    assert summary["range_attribution"]["qwen35_deltanet_recurrence"][
+        "cuda_total_ms"
+    ] == pytest.approx(0.1)
