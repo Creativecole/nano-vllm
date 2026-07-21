@@ -12,6 +12,7 @@ from benchmarks.qwen35_hybrid.profile_serving import (
 from benchmarks.qwen35_hybrid.common import write_json
 from benchmarks.qwen35_hybrid.run_nsight import build_command
 from benchmarks.qwen35_hybrid.profile_layers import (
+    compare_deltanet_profiles,
     resolve_layer_ids,
     summarize_layer_profile,
 )
@@ -160,6 +161,8 @@ def _profile_args(path):
         warmup=1,
         record_shapes=True,
         profile_memory=False,
+        deltanet_backend="sequential",
+        deltanet_chunk_size=64,
         no_resume=False,
         save_json=str(path),
     )
@@ -245,3 +248,32 @@ def test_layer_profile_counts_only_positive_duration_cuda_events():
     assert summary["range_attribution"]["qwen35_deltanet_recurrence"][
         "cuda_total_ms"
     ] == pytest.approx(0.1)
+
+
+def test_layer_profile_compares_sequential_and_chunked_backends():
+    base = {
+        "layer_id": 0,
+        "layer_type": "linear_attention",
+        "batch_size": 1,
+        "prompt_len": 512,
+    }
+    comparison = compare_deltanet_profiles(
+        [
+            {
+                **base,
+                "deltanet_backend": "sequential",
+                "cuda_time_ms_per_forward": 200.0,
+                "kernel_count_per_forward": 5000,
+                "peak_memory_delta_mb": 100.0,
+            },
+            {
+                **base,
+                "deltanet_backend": "chunked",
+                "cuda_time_ms_per_forward": 50.0,
+                "kernel_count_per_forward": 500,
+                "peak_memory_delta_mb": 300.0,
+            },
+        ]
+    )[0]
+    assert comparison["cuda_speedup"] == 4.0
+    assert comparison["kernel_count_reduction"] == pytest.approx(0.9)

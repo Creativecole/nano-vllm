@@ -44,6 +44,8 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(config.dtype)
         torch.set_default_device("cuda")
+        hf_config.nanovllm_deltanet_backend = config.deltanet_backend
+        hf_config.nanovllm_deltanet_chunk_size = config.deltanet_chunk_size
         self.model = model_class(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()

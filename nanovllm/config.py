@@ -53,6 +53,8 @@ class Config:
     enforce_eager: bool = False
     hybrid_state_capacity: int = 0
     hybrid_state_memory_fraction: float = 0.1
+    deltanet_backend: str = "sequential"
+    deltanet_chunk_size: int = 64
     enable_prefix_cache: bool = True
     hf_config: object | None = None
     hf_text_config: object | None = None
@@ -67,6 +69,13 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.hybrid_state_capacity >= 0
         assert 0 < self.hybrid_state_memory_fraction < 1
+        if self.deltanet_backend not in ("sequential", "chunked"):
+            raise ValueError(
+                "deltanet_backend must be 'sequential' or 'chunked', got "
+                f"{self.deltanet_backend!r}"
+            )
+        if self.deltanet_chunk_size <= 0:
+            raise ValueError("deltanet_chunk_size must be positive")
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.hf_text_config = get_hf_text_config(self.hf_config)
         dtype_value = self.dtype

@@ -31,6 +31,10 @@ Attention uses paged KV storage plus FlashAttention varlen; DeltaNet uses the st
 packed path. Decoder MLP and outer RMSNorm are excluded so their GEMMs do not obscure
 the mixer comparison.
 
+The commands below describe the original sequential-only run. The profiler now also
+supports the chunked reference backend; use the Phase 6 commands in
+`06_chunked_recurrence.md` for a side-by-side run without replacing this baseline.
+
 Run the first configured layer of each type at batch 1:
 
 ```bash
@@ -59,14 +63,14 @@ python benchmarks/qwen35_hybrid/profile_layers.py \
   --prompt-len 2048
 ```
 
-The script atomically checkpoints:
+The original run atomically checkpointed:
 
 - `benchmarks/qwen35_hybrid/results/layer_profile.json`
 - `benchmarks/qwen35_hybrid/results/traces/layers/*.json`
 - this Markdown file with the measured comparison table
 
-Re-running the same command resumes from `layer_profile.json` and skips completed
-layer/prompt combinations. Use `--no-resume` only to replace an existing matrix.
+The current comparison schema intentionally writes to `deltanet_backend_profile.json`
+instead, so the measured sequential baseline remains available.
 
 ## Questions To Resolve From Layer Data
 

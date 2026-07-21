@@ -64,3 +64,35 @@ def test_explicit_config_dtype_accepts_string(monkeypatch, tmp_path):
     )
     config = Config(model=str(tmp_path), dtype="torch.float16")
     assert config.dtype is torch.float16
+
+
+def test_config_accepts_chunked_deltanet_backend(monkeypatch, tmp_path):
+    text = SimpleNamespace(dtype=torch.bfloat16, max_position_embeddings=128)
+    monkeypatch.setattr(
+        "nanovllm.config.AutoConfig.from_pretrained",
+        lambda _model: text,
+    )
+    config = Config(
+        model=str(tmp_path),
+        deltanet_backend="chunked",
+        deltanet_chunk_size=32,
+    )
+    assert config.deltanet_backend == "chunked"
+    assert config.deltanet_chunk_size == 32
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"deltanet_backend": "fused"},
+        {"deltanet_chunk_size": 0},
+    ],
+)
+def test_config_rejects_invalid_deltanet_settings(monkeypatch, tmp_path, kwargs):
+    text = SimpleNamespace(dtype=torch.bfloat16, max_position_embeddings=128)
+    monkeypatch.setattr(
+        "nanovllm.config.AutoConfig.from_pretrained",
+        lambda _model: text,
+    )
+    with pytest.raises(ValueError):
+        Config(model=str(tmp_path), **kwargs)

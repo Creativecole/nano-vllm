@@ -41,6 +41,12 @@ def parse_args():
     parser.add_argument("--atol", type=float, default=5e-2)
     parser.add_argument("--rtol", type=float, default=5e-2)
     parser.add_argument(
+        "--deltanet-backend",
+        choices=("sequential", "chunked"),
+        default="sequential",
+    )
+    parser.add_argument("--deltanet-chunk-size", type=int, default=64)
+    parser.add_argument(
         "--skip-continuous-batching",
         action="store_true",
         help="Skip the mixed-length dynamic-admission workload for staged spot checks.",
@@ -195,7 +201,11 @@ def run_hf_worker(args, prompt_lens, batch_sizes, decode_steps):
 def run_nano_no_cache_worker(args, prompt_lens):
     require_cuda()
     print("[correctness:nano-no-cache] loading text-only reference", flush=True)
-    model, config, report = load_nano_text_reference(args.model)
+    model, config, report = load_nano_text_reference(
+        args.model,
+        deltanet_backend=args.deltanet_backend,
+        deltanet_chunk_size=args.deltanet_chunk_size,
+    )
     payload = {
         "backend": "nanovllm_no_cache",
         "coverage": report_to_dict(report),
@@ -234,6 +244,8 @@ def run_nano_serving_worker(args, prompt_lens, batch_sizes, decode_steps):
         hybrid_state_capacity=max_batch,
         max_model_len=max(prompt_lens) + max_steps + 1,
         max_num_batched_tokens=max_batch * max(prompt_lens),
+        deltanet_backend=args.deltanet_backend,
+        deltanet_chunk_size=args.deltanet_chunk_size,
     )
     payload = {
         "backend": "nanovllm_hybrid",
@@ -341,6 +353,10 @@ def invoke_worker(args, worker: str, artifact: Path):
         args.batch_sizes,
         "--decode-steps",
         args.decode_steps,
+        "--deltanet-backend",
+        args.deltanet_backend,
+        "--deltanet-chunk-size",
+        str(args.deltanet_chunk_size),
         "--worker",
         worker,
         "--artifact",
@@ -553,6 +569,8 @@ def main():
     prompt_lens = parse_int_list(args.prompt_lens)
     batch_sizes = parse_int_list(args.batch_sizes)
     decode_steps = parse_int_list(args.decode_steps)
+    if args.deltanet_chunk_size <= 0:
+        raise ValueError("--deltanet-chunk-size must be positive")
     if args.worker:
         if not args.artifact:
             raise ValueError("--artifact is required in worker mode")
@@ -587,6 +605,8 @@ def main():
                 "decode_steps": decode_steps,
                 "atol": args.atol,
                 "rtol": args.rtol,
+                "deltanet_backend": args.deltanet_backend,
+                "deltanet_chunk_size": args.deltanet_chunk_size,
             },
             "weight_coverage": {
                 name: worker.get("coverage")

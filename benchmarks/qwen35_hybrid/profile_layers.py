@@ -37,8 +37,8 @@ from nanovllm.utils.profiler import (  # noqa: E402
 )
 
 
-DEFAULT_JSON = DEFAULT_RESULTS_DIR / "layer_profile.json"
-DEFAULT_MD = REPO_ROOT / "docs/qwen35_hybrid/05_deltanet_profile.md"
+DEFAULT_JSON = DEFAULT_RESULTS_DIR / "deltanet_backend_profile.json"
+DEFAULT_MD = REPO_ROOT / "docs/qwen35_hybrid/06_chunked_recurrence_profile.md"
 
 
 def parse_args():
@@ -64,6 +64,12 @@ def parse_args():
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument(
+        "--deltanet-backends",
+        default="sequential,chunked",
+        help="Comma-separated DeltaNet reference backends to compare.",
+    )
+    parser.add_argument("--deltanet-chunk-size", type=int, default=64)
     parser.add_argument("--record-shapes", action="store_true")
     parser.add_argument("--profile-memory", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
@@ -95,12 +101,13 @@ def resolve_layer_ids(layer_types, requested):
 def layer_case_key(row):
     return (
         int(row["layer_id"]),
+        str(row.get("deltanet_backend", "not_applicable")),
         int(row["batch_size"]),
         int(row["prompt_len"]),
     )
 
 
-def layer_matrix_spec(args, layer_ids, prompt_lens):
+def layer_matrix_spec(args, layer_ids, prompt_lens, deltanet_backends):
     return {
         "layer_ids": layer_ids,
         "batch_size": args.batch_size,
@@ -108,6 +115,8 @@ def layer_matrix_spec(args, layer_ids, prompt_lens):
         "block_size": args.block_size,
         "warmup": args.warmup,
         "repeat": args.repeat,
+        "deltanet_backends": deltanet_backends,
+        "deltanet_chunk_size": args.deltanet_chunk_size,
         "record_shapes": args.record_shapes,
         "profile_memory": args.profile_memory,
     }
@@ -119,7 +128,7 @@ def load_layer_checkpoint(args, spec):
         return []
     payload = json.loads(path.read_text())
     if (
-        payload.get("schema_version") != 1
+        payload.get("schema_version") != 2
         or payload.get("environment", {}).get("model") != args.model
         or payload.get("matrix") != spec
     ):
@@ -280,7 +289,9 @@ def summarize_layer_profile(prof, repeat, wall_time_s):
 
 
 @torch.inference_mode()
-def profile_layer(model, layer_id, batch_size, prompt_len, args):
+def profile_layer(
+    model, layer_id, batch_size, prompt_len, deltanet_backend, args
+):
     layer = model.model.layers[layer_id]
     layer_type = layer.block_type
     parameter = next(layer.parameters())
@@ -302,6 +313,8 @@ def profile_layer(model, layer_id, batch_size, prompt_len, args):
     else:
         layer_state = make_deltanet_state(layer, batch_size, dtype, device)
         mixer = layer.linear_attn
+        mixer.deltanet_backend = deltanet_backend
+        mixer.deltanet_chunk_size = args.deltanet_chunk_size
 
     def run_once():
         range_name = (
@@ -317,6 +330,8 @@ def profile_layer(model, layer_id, batch_size, prompt_len, args):
     for _ in range(args.warmup):
         run_once()
     torch.cuda.synchronize()
+    baseline_memory = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
     start = time.perf_counter()
     with torch.profiler.profile(
         activities=(
@@ -335,7 +350,8 @@ def profile_layer(model, layer_id, batch_size, prompt_len, args):
     trace_dir = Path(args.trace_dir)
     trace_dir.mkdir(parents=True, exist_ok=True)
     trace_path = trace_dir / (
-        f"layer{layer_id}_{layer_type}_b{batch_size}_p{prompt_len}.json"
+        f"layer{layer_id}_{layer_type}_{deltanet_backend}_"
+        f"b{batch_size}_p{prompt_len}.json"
     )
     prof.export_chrome_trace(str(trace_path))
     reset_context()
@@ -343,6 +359,10 @@ def profile_layer(model, layer_id, batch_size, prompt_len, args):
     return {
         "layer_id": layer_id,
         "layer_type": layer_type,
+        "deltanet_backend": deltanet_backend,
+        "deltanet_chunk_size": args.deltanet_chunk_size
+        if layer_type == "linear_attention"
+        else None,
         "profile_scope": "token_mixer_serving_prefill",
         "batch_size": batch_size,
         "prompt_len": prompt_len,
@@ -351,6 +371,11 @@ def profile_layer(model, layer_id, batch_size, prompt_len, args):
         "kernels_per_input_token": (
             summary["kernel_count"] / args.repeat / total_tokens
         ),
+        "peak_memory_allocated_gb": torch.cuda.max_memory_allocated() / 2**30,
+        "peak_memory_delta_mb": max(
+            0, torch.cuda.max_memory_allocated() - baseline_memory
+        )
+        / 2**20,
         **summary,
     }
 
@@ -361,35 +386,62 @@ def render_markdown(payload):
         [
             "layer",
             "type",
+            "backend",
             "batch",
             "prompt",
             "CUDA ms/forward",
             "CPU ms/forward",
             "kernels/forward",
             "kernels/input token",
+            "peak delta MiB",
         ],
         [
             [
                 row["layer_id"],
                 row["layer_type"],
+                row["deltanet_backend"],
                 row["batch_size"],
                 row["prompt_len"],
                 row["cuda_time_ms_per_forward"],
                 row["cpu_time_ms_per_forward"],
                 row["kernel_count_per_forward"],
                 row["kernels_per_input_token"],
+                row["peak_memory_delta_mb"],
             ]
             for row in rows
+        ],
+    )
+    comparisons = payload.get("backend_comparison", [])
+    comparison_table = markdown_table(
+        [
+            "layer",
+            "batch",
+            "prompt",
+            "CUDA speedup",
+            "kernel reduction",
+            "sequential peak delta MiB",
+            "chunked peak delta MiB",
+        ],
+        [
+            [
+                row["layer_id"],
+                row["batch_size"],
+                row["prompt_len"],
+                row["cuda_speedup"],
+                row["kernel_count_reduction"],
+                row["sequential_peak_memory_delta_mb"],
+                row["chunked_peak_memory_delta_mb"],
+            ]
+            for row in comparisons
         ],
     )
     return f"""# Qwen3.5 DeltaNet Kernel Fragmentation
 
 ## Code-Level Root Cause
 
-`gated_delta_rule_reference` executes a Python `for token_idx in range(seq_len)`
-loop. Each token performs decay, state retrieval, two reductions, delta construction,
-state update, and output projection as separate PyTorch operations. Packed prefill also
-loops over requests before entering the token loop.
+The `sequential` reference executes a Python `for token_idx in range(seq_len)` loop.
+The `chunked` reference replaces that sequence-length loop with chunk-level matrix
+operations while retaining FP32 recurrent accumulation and BF16 model I/O.
 
 For Qwen3.5-9B, 24 DeltaNet layers at prompt length 2048 produce 49,152 token-layer
 iterations. Roughly five elementwise and two reduction launches per iteration predict
@@ -402,15 +454,20 @@ candidate.
 
 {table}
 
+## Sequential -> Chunked Delta
+
+{comparison_table}
+
 The scope is the real packed serving token mixer: Full Attention uses the existing
 FlashAttention varlen path and paged-KV store, while DeltaNet uses its stateful packed
 prefill path. Decoder MLP and outer RMSNorm are intentionally excluded.
 
 ## Interpretation
 
-- Compare kernel count growth from prompt 128 -> 512 -> 2048. Linear growth for
-  DeltaNet is expected from the explicit token loop.
-- Inspect `qwen35_deltanet_recurrence`, `qwen35_deltanet_conv`, and
+- Compare `sequential` and `chunked` kernel count, CUDA time, and temporary-memory
+  delta at each prompt length.
+- Inspect `qwen35_deltanet_recurrence_sequential`,
+  `qwen35_deltanet_recurrence_chunked`, `qwen35_deltanet_conv`, and
   `qwen35_deltanet_output` in each row's `range_attribution` before selecting a target.
 - Fusion candidates are the recurrent decay/retrieval/delta/state/output sequence and
   its Q/K normalization. Projection GEMMs and causal convolution should remain library
@@ -419,77 +476,157 @@ prefill path. Decoder MLP and outer RMSNorm are intentionally excluded.
   optimized causal-convolution/recurrent kernels when available; they avoid issuing a
   Python-controlled chain of elementwise/reduction kernels for every token.
 
-No model logic or kernel implementation is changed by this experiment.
+Both paths are non-fused PyTorch references; this experiment changes the execution
+model, not the DeltaNet recurrence math.
 """
+
+
+def compare_deltanet_profiles(rows):
+    grouped = defaultdict(dict)
+    for row in rows:
+        if row["layer_type"] != "linear_attention":
+            continue
+        key = (row["layer_id"], row["batch_size"], row["prompt_len"])
+        grouped[key][row["deltanet_backend"]] = row
+    comparisons = []
+    for key, backends in sorted(grouped.items()):
+        if "sequential" not in backends or "chunked" not in backends:
+            continue
+        sequential = backends["sequential"]
+        chunked = backends["chunked"]
+        sequential_cuda = sequential["cuda_time_ms_per_forward"]
+        chunked_cuda = chunked["cuda_time_ms_per_forward"]
+        sequential_kernels = sequential["kernel_count_per_forward"]
+        chunked_kernels = chunked["kernel_count_per_forward"]
+        comparisons.append(
+            {
+                "layer_id": key[0],
+                "batch_size": key[1],
+                "prompt_len": key[2],
+                "cuda_speedup": sequential_cuda / chunked_cuda
+                if chunked_cuda
+                else None,
+                "kernel_count_reduction": 1 - chunked_kernels / sequential_kernels
+                if sequential_kernels
+                else None,
+                "sequential_peak_memory_delta_mb": sequential[
+                    "peak_memory_delta_mb"
+                ],
+                "chunked_peak_memory_delta_mb": chunked["peak_memory_delta_mb"],
+            }
+        )
+    return comparisons
 
 
 def main():
     args = parse_args()
     require_cuda()
-    if args.batch_size <= 0 or args.warmup < 0 or args.repeat <= 0:
+    if (
+        args.batch_size <= 0
+        or args.warmup < 0
+        or args.repeat <= 0
+        or args.deltanet_chunk_size <= 0
+    ):
         raise ValueError("batch-size/repeat must be positive and warmup non-negative")
     prompt_lens = args.prompt_len or [128, 512, 2048]
     if any(value <= 0 for value in prompt_lens):
         raise ValueError("prompt lengths must be positive")
+    deltanet_backends = [
+        item.strip() for item in args.deltanet_backends.split(",") if item.strip()
+    ]
+    invalid_backends = set(deltanet_backends) - {"sequential", "chunked"}
+    if not deltanet_backends or invalid_backends:
+        raise ValueError(
+            f"Unsupported DeltaNet backends: {sorted(invalid_backends)}"
+        )
 
     configure_profile_ranges(torch_ranges=True)
     facts = load_model_facts(args.model)
     layer_ids = resolve_layer_ids(facts["layer_types"], args.layer_id)
-    spec = layer_matrix_spec(args, layer_ids, prompt_lens)
+    spec = layer_matrix_spec(
+        args, layer_ids, prompt_lens, deltanet_backends
+    )
     rows = load_layer_checkpoint(args, spec)
     completed = {layer_case_key(row) for row in rows}
-    expected = len(layer_ids) * len(prompt_lens)
+    expected = sum(
+        len(prompt_lens)
+        * (
+            len(deltanet_backends)
+            if facts["layer_types"][layer_id] == "linear_attention"
+            else 1
+        )
+        for layer_id in layer_ids
+    )
     if len(completed) == expected:
         print(f"[resume] all {expected} layer cases are complete", flush=True)
         return
     model, _, load_report = load_nano_text_reference(args.model)
     try:
         for layer_id in layer_ids:
-            for prompt_len in prompt_lens:
-                layer_type = facts["layer_types"][layer_id]
-                key = (layer_id, args.batch_size, prompt_len)
-                if key in completed:
+            layer_type = facts["layer_types"][layer_id]
+            backends = (
+                deltanet_backends
+                if layer_type == "linear_attention"
+                else ["not_applicable"]
+            )
+            for deltanet_backend in backends:
+                for prompt_len in prompt_lens:
+                    key = (
+                        layer_id,
+                        deltanet_backend,
+                        args.batch_size,
+                        prompt_len,
+                    )
+                    if key in completed:
+                        print(
+                            f"[layer-profile] SKIP layer={layer_id} "
+                            f"backend={deltanet_backend} prompt={prompt_len}",
+                            flush=True,
+                        )
+                        continue
                     print(
-                        f"[layer-profile] SKIP layer={layer_id} prompt={prompt_len}",
+                        f"[layer-profile] layer={layer_id} type={layer_type} "
+                        f"backend={deltanet_backend} batch={args.batch_size} "
+                        f"prompt={prompt_len}",
                         flush=True,
                     )
-                    continue
-                print(
-                    f"[layer-profile] layer={layer_id} type={layer_type} "
-                    f"batch={args.batch_size} prompt={prompt_len}",
-                    flush=True,
-                )
-                row = profile_layer(
-                    model, layer_id, args.batch_size, prompt_len, args
-                )
-                rows.append(row)
-                payload = {
-                    "schema_version": 1,
-                    "environment": environment_metadata(args.model),
-                    "model_facts": facts,
-                    "matrix": spec,
-                    "completed_cases": len(rows),
-                    "expected_cases": expected,
-                    "weight_load_counts": {
-                        "loaded": len(load_report.loaded),
-                        "missing": len(load_report.missing),
-                        "duplicate": len(load_report.duplicate),
-                        "unexpected_text_weights": len(
-                            load_report.unexpected_text_weights
-                        ),
-                        "intentionally_skipped_non_text": len(
-                            load_report.intentionally_skipped_non_text
-                        ),
-                        "tied_aliases": len(load_report.tied_aliases),
-                    },
-                    "profiles": sorted(rows, key=layer_case_key),
-                }
-                write_json(args.save_json, payload)
-                write_text(args.save_md, render_markdown(payload))
-                print(
-                    f"[checkpoint] {len(rows)} layer cases -> {args.save_json}",
-                    flush=True,
-                )
+                    row = profile_layer(
+                        model,
+                        layer_id,
+                        args.batch_size,
+                        prompt_len,
+                        deltanet_backend,
+                        args,
+                    )
+                    rows.append(row)
+                    payload = {
+                        "schema_version": 2,
+                        "environment": environment_metadata(args.model),
+                        "model_facts": facts,
+                        "matrix": spec,
+                        "completed_cases": len(rows),
+                        "expected_cases": expected,
+                        "weight_load_counts": {
+                            "loaded": len(load_report.loaded),
+                            "missing": len(load_report.missing),
+                            "duplicate": len(load_report.duplicate),
+                            "unexpected_text_weights": len(
+                                load_report.unexpected_text_weights
+                            ),
+                            "intentionally_skipped_non_text": len(
+                                load_report.intentionally_skipped_non_text
+                            ),
+                            "tied_aliases": len(load_report.tied_aliases),
+                        },
+                        "profiles": sorted(rows, key=layer_case_key),
+                        "backend_comparison": compare_deltanet_profiles(rows),
+                    }
+                    write_json(args.save_json, payload)
+                    write_text(args.save_md, render_markdown(payload))
+                    print(
+                        f"[checkpoint] {len(rows)} layer cases -> {args.save_json}",
+                        flush=True,
+                    )
     finally:
         reset_context()
         del model

@@ -58,6 +58,7 @@ def parse_args():
     parser.add_argument("--output-lens", default="32,128")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=5)
+    parser.add_argument("--deltanet-chunk-size", type=int, default=64)
     parser.add_argument(
         "--save-json",
         default=str(DEFAULT_RESULTS_DIR / "e2e_benchmark.json"),
@@ -66,7 +67,16 @@ def parse_args():
         "--save-md",
         default=str(REPO_ROOT / "docs/qwen35_hybrid/04_benchmark_results.md"),
     )
-    parser.add_argument("--worker", choices=("hf", "nanovllm", "vllm"))
+    parser.add_argument(
+        "--worker",
+        choices=(
+            "hf",
+            "nanovllm",
+            "nanovllm_sequential",
+            "nanovllm_chunked",
+            "vllm",
+        ),
+    )
     parser.add_argument("--worker-output")
     return parser.parse_args()
 
@@ -231,9 +241,12 @@ def create_backend(args, facts):
     if args.worker == "hf":
         model, _, _ = load_hf_text_reference(args.model)
         return model, run_hf_case, None
-    if args.worker == "nanovllm":
+    if args.worker.startswith("nanovllm"):
         from nanovllm import LLM
 
+        deltanet_backend = (
+            "chunked" if args.worker == "nanovllm_chunked" else "sequential"
+        )
         llm = LLM(
             args.model,
             enforce_eager=True,
@@ -241,6 +254,8 @@ def create_backend(args, facts):
             hybrid_state_capacity=max_batch,
             max_model_len=max_model_len,
             max_num_batched_tokens=max_batch * max_prompt,
+            deltanet_backend=deltanet_backend,
+            deltanet_chunk_size=args.deltanet_chunk_size,
         )
         stats = llm.model_runner.call("get_hybrid_state_stats")
         return llm, run_nanovllm_case, stats
@@ -330,7 +345,7 @@ def run_backend_worker(args, batch_sizes, prompt_lens, output_lens):
                             "aborted_after_failure": True,
                         }
     finally:
-        if args.worker == "nanovllm" and backend is not None:
+        if args.worker.startswith("nanovllm") and backend is not None:
             backend.exit()
     return {
         "backend": args.worker,
@@ -358,6 +373,8 @@ def invoke_backend(args, backend, output_path):
         str(args.warmup),
         "--repeat",
         str(args.repeat),
+        "--deltanet-chunk-size",
+        str(args.deltanet_chunk_size),
         "--worker",
         backend,
         "--worker-output",
@@ -419,6 +436,42 @@ def aggregate_rows(rows):
     return summaries
 
 
+def compare_deltanet_backends(summaries):
+    grouped = {}
+    for row in summaries:
+        key = (row["batch_size"], row["prompt_len"], row["output_len"])
+        grouped.setdefault(key, {})[row["backend"]] = row
+    comparisons = []
+    for key, backends in sorted(grouped.items()):
+        sequential = backends.get("nanovllm_sequential")
+        chunked = backends.get("nanovllm_chunked")
+        if sequential is None or chunked is None:
+            continue
+        sequential_ttft = sequential["ttft_s_mean"]
+        chunked_ttft = chunked["ttft_s_mean"]
+        sequential_decode = sequential["decode_tokens_per_s_mean"]
+        chunked_decode = chunked["decode_tokens_per_s_mean"]
+        sequential_peak = sequential["peak_memory_gb_mean"]
+        chunked_peak = chunked["peak_memory_gb_mean"]
+        comparisons.append(
+            {
+                "batch_size": key[0],
+                "prompt_len": key[1],
+                "output_len": key[2],
+                "ttft_speedup": sequential_ttft / chunked_ttft
+                if chunked_ttft
+                else None,
+                "decode_throughput_ratio": chunked_decode / sequential_decode
+                if sequential_decode
+                else None,
+                "peak_memory_delta_gb": chunked_peak - sequential_peak
+                if chunked_peak is not None and sequential_peak is not None
+                else None,
+            }
+        )
+    return comparisons
+
+
 def render_markdown(payload):
     rows = payload["summary"]
     table = markdown_table(
@@ -465,6 +518,27 @@ def render_markdown(payload):
             for row in rows
         ],
     )
+    comparison = markdown_table(
+        [
+            "batch",
+            "prompt",
+            "output",
+            "TTFT speedup",
+            "decode throughput ratio",
+            "chunked - sequential peak GiB",
+        ],
+        [
+            [
+                row["batch_size"],
+                row["prompt_len"],
+                row["output_len"],
+                row["ttft_speedup"],
+                row["decode_throughput_ratio"],
+                row["peak_memory_delta_gb"],
+            ]
+            for row in payload.get("deltanet_backend_comparison", [])
+        ],
+    )
     failures = payload["failures"]
     failure_text = (
         "None."
@@ -482,12 +556,22 @@ Backends run in isolated processes with identical token IDs, BF16 weights, greed
 generation, eager execution, warmup={payload['matrix']['warmup']}, and
 repeat={payload['matrix']['repeat']}. `N/A` means that a backend version did not expose
 the required request-level timing rather than an inferred value being substituted.
+`nanovllm_sequential` and `nanovllm_chunked` differ only in the PyTorch DeltaNet
+prefill recurrence execution model; single-token decode remains recurrent.
 
 ## Performance
 
 {table}
 
 The JSON artifact contains mean, p50, and p95 across repeats for every metric.
+
+## Sequential -> Chunked DeltaNet
+
+{comparison}
+
+TTFT is the expected impact surface because chunked recurrence is used for prefill.
+Single-token decode intentionally keeps the sequential recurrent update, so the decode
+throughput ratio is a regression guard rather than the optimization claim.
 
 ## Active Cache Footprint
 
@@ -507,7 +591,7 @@ def main():
     batch_sizes = parse_int_list(args.batch_sizes)
     prompt_lens = parse_int_list(args.prompt_lens)
     output_lens = parse_int_list(args.output_lens)
-    if args.repeat < 1 or args.warmup < 0:
+    if args.repeat < 1 or args.warmup < 0 or args.deltanet_chunk_size <= 0:
         raise ValueError("--repeat must be >= 1 and --warmup must be >= 0")
     if args.worker:
         if not args.worker_output:
@@ -529,7 +613,13 @@ def main():
 
     require_cuda()
     backends = [item.strip() for item in args.backends.split(",") if item.strip()]
-    unsupported = set(backends) - {"hf", "nanovllm", "vllm"}
+    unsupported = set(backends) - {
+        "hf",
+        "nanovllm",
+        "nanovllm_sequential",
+        "nanovllm_chunked",
+        "vllm",
+    }
     if unsupported:
         raise ValueError(f"Unsupported backends: {sorted(unsupported)}")
     worker_dir = DEFAULT_RESULTS_DIR / ".e2e_workers"
@@ -547,6 +637,7 @@ def main():
             for output in worker_outputs
             for failure in output.get("failures", [])
         ]
+        summary = aggregate_rows(rows)
         payload = {
             "environment": environment_metadata(args.model),
             "model_facts": load_model_facts(args.model),
@@ -557,9 +648,11 @@ def main():
                 "output_lens": output_lens,
                 "warmup": args.warmup,
                 "repeat": args.repeat,
+                "deltanet_chunk_size": args.deltanet_chunk_size,
             },
             "runs": rows,
-            "summary": aggregate_rows(rows),
+            "summary": summary,
+            "deltanet_backend_comparison": compare_deltanet_backends(summary),
             "failures": failures,
         }
         write_json(args.save_json, payload)

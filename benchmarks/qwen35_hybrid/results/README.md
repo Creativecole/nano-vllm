@@ -12,6 +12,13 @@ Expected Phase 5 outputs:
 - `nsight/*.nsys-rep`: selected Nsight Systems timelines.
 - `nsight/*.ncu-rep`: one or two profiler-selected Nsight Compute kernel reports.
 
+Expected chunked-reference validation outputs:
+
+- `chunked_correctness.json`: HF logits and greedy-token comparison.
+- `deltanet_backend_profile.json`: sequential/chunked layer CUDA time, kernel count,
+  and temporary-memory comparison.
+- `chunked_e2e.json`: isolated-process TTFT, decode, and peak-memory comparison.
+
 The generated human-readable summary is
 `docs/qwen35_hybrid/05_profile_analysis.md`. Large raw traces should be archived for
 analysis and do not need to be committed to Git.

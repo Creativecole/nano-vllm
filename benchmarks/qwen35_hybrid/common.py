@@ -209,11 +209,18 @@ def load_hf_text_reference(model: str, device: str = "cuda"):
     return reference, text_config, report
 
 
-def load_nano_text_reference(model: str, device: str = "cuda"):
+def load_nano_text_reference(
+    model: str,
+    device: str = "cuda",
+    deltanet_backend: str = "sequential",
+    deltanet_chunk_size: int = 64,
+):
     from nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM
     from nanovllm.utils.loader import load_model
 
     _, text_config = load_text_configs(model)
+    text_config.nanovllm_deltanet_backend = deltanet_backend
+    text_config.nanovllm_deltanet_chunk_size = deltanet_chunk_size
     reference = _construct_on_device(Qwen3_5ForCausalLM, text_config, device)
     report = load_model(reference, model, strict=True)
     return reference, text_config, report

@@ -375,6 +375,126 @@ def gated_delta_rule_reference(
     return output, state
 
 
+def chunked_gated_delta_rule_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    decay: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP32 PyTorch chunked Gated DeltaNet reference with BF16/FP16 output."""
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    input_dtype = query.dtype
+    query = l2norm(query.float()) * (query.shape[-1] ** -0.5)
+    key = l2norm(key.float())
+    value = value.float()
+    decay = decay.float()
+    beta = beta.float()
+
+    query, key, value = (
+        tensor.transpose(1, 2).contiguous() for tensor in (query, key, value)
+    )
+    decay = decay.transpose(1, 2).contiguous()
+    beta = beta.transpose(1, 2).contiguous()
+    batch_size, num_heads, seq_len, key_dim = key.shape
+    value_dim = value.shape[-1]
+    pad_size = (chunk_size - seq_len % chunk_size) % chunk_size
+    query = F.pad(query, (0, 0, 0, pad_size))
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    decay = F.pad(decay, (0, pad_size))
+    padded_len = seq_len + pad_size
+
+    value_beta = value * beta.unsqueeze(-1)
+    key_beta = key * beta.unsqueeze(-1)
+    query, key, key_beta, value_beta = (
+        tensor.reshape(
+            batch_size,
+            num_heads,
+            -1,
+            chunk_size,
+            tensor.shape[-1],
+        )
+        for tensor in (query, key, key_beta, value_beta)
+    )
+    decay = decay.reshape(batch_size, num_heads, -1, chunk_size).cumsum(dim=-1)
+
+    causal_mask = torch.triu(
+        torch.ones(
+            chunk_size,
+            chunk_size,
+            dtype=torch.bool,
+            device=query.device,
+        ),
+        diagonal=0,
+    )
+    decay_mask = (
+        (decay.unsqueeze(-1) - decay.unsqueeze(-2)).tril().exp().float()
+    ).tril()
+    transition = -(
+        (key_beta @ key.transpose(-1, -2)) * decay_mask
+    ).masked_fill(causal_mask, 0)
+
+    # Build every chunk's lower-triangular inverse in parallel. This loop is fixed by
+    # chunk_size; it does not scale with the full prompt length.
+    for row_idx in range(1, chunk_size):
+        row = transition[..., row_idx, :row_idx].clone()
+        lower = transition[..., :row_idx, :row_idx].clone()
+        transition[..., row_idx, :row_idx] = row + (
+            row.unsqueeze(-1) * lower
+        ).sum(-2)
+    transition = transition + torch.eye(
+        chunk_size, dtype=transition.dtype, device=transition.device
+    )
+
+    value_updates = transition @ value_beta
+    decayed_keys = transition @ (key_beta * decay.exp().unsqueeze(-1))
+    if initial_state is None:
+        state = torch.zeros(
+            batch_size,
+            num_heads,
+            key_dim,
+            value_dim,
+            dtype=torch.float32,
+            device=query.device,
+        )
+    else:
+        expected = (batch_size, num_heads, key_dim, value_dim)
+        if tuple(initial_state.shape) != expected:
+            raise ValueError(
+                f"initial_state has shape {tuple(initial_state.shape)}, expected {expected}"
+            )
+        state = initial_state.float()
+
+    output = torch.zeros_like(value_updates)
+    num_chunks = padded_len // chunk_size
+    for chunk_idx in range(num_chunks):
+        query_chunk = query[:, :, chunk_idx]
+        key_chunk = key[:, :, chunk_idx]
+        value_chunk = value_updates[:, :, chunk_idx]
+        chunk_decay = decay[:, :, chunk_idx]
+        attention = (
+            query_chunk @ key_chunk.transpose(-1, -2)
+        ) * decay_mask[:, :, chunk_idx]
+        state_correction = decayed_keys[:, :, chunk_idx] @ state
+        corrected_value = value_chunk - state_correction
+        state_output = (query_chunk * chunk_decay.exp().unsqueeze(-1)) @ state
+        output[:, :, chunk_idx] = state_output + attention @ corrected_value
+        final_decay = chunk_decay[:, :, -1]
+        state = state * final_decay.exp().unsqueeze(-1).unsqueeze(-1) + (
+            key_chunk
+            * (final_decay.unsqueeze(-1) - chunk_decay).exp().unsqueeze(-1)
+        ).transpose(-1, -2) @ corrected_value
+
+    output = output.reshape(batch_size, num_heads, padded_len, value_dim)
+    output = output[:, :, :seq_len].transpose(1, 2).contiguous().to(input_dtype)
+    return output, state
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
 
     def __init__(self, config, layer_idx: int):
@@ -391,6 +511,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.deltanet_backend = _config_value(
+            config, "nanovllm_deltanet_backend", "sequential"
+        )
+        self.deltanet_chunk_size = int(
+            _config_value(config, "nanovllm_deltanet_chunk_size", 64)
+        )
+        if self.deltanet_backend not in ("sequential", "chunked"):
+            raise ValueError(f"Unsupported DeltaNet backend {self.deltanet_backend!r}")
+        if self.deltanet_chunk_size <= 0:
+            raise ValueError("DeltaNet chunk size must be positive")
 
         self.conv1d = nn.Conv1d(
             self.conv_dim,
@@ -408,6 +538,37 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+
+    def _run_recurrence(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        decay: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        use_chunked = self.deltanet_backend == "chunked" and query.shape[1] > 1
+        backend = "chunked" if use_chunked else "sequential"
+        with profile_range(f"qwen35_deltanet_recurrence_{backend}"):
+            if use_chunked:
+                return chunked_gated_delta_rule_reference(
+                    query,
+                    key,
+                    value,
+                    decay,
+                    beta,
+                    initial_state=initial_state,
+                    chunk_size=self.deltanet_chunk_size,
+                )
+            return gated_delta_rule_reference(
+                query,
+                key,
+                value,
+                decay,
+                beta,
+                initial_state=initial_state,
+            )
 
     def _forward_stateful_chunk(
         self,
@@ -447,16 +608,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         decay = -self.A_log.float().exp() * F.softplus(
             self.in_proj_a(hidden_states).float() + self.dt_bias.float()
         )
-        with profile_range("qwen35_deltanet_recurrence"):
-            core_output, final_state = gated_delta_rule_reference(
-                query,
-                key,
-                value,
-                decay,
-                beta,
-                initial_state=layer_state.recurrent_state,
-            )
-            layer_state.recurrent_state.copy_(final_state)
+        core_output, final_state = self._run_recurrence(
+            query,
+            key,
+            value,
+            decay,
+            beta,
+            initial_state=layer_state.recurrent_state,
+        )
+        layer_state.recurrent_state.copy_(final_state)
         with profile_range("qwen35_deltanet_output"):
             z = self.in_proj_z(hidden_states).view(
                 batch_size, seq_len, self.num_v_heads, self.head_v_dim
@@ -523,7 +683,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.in_proj_a(hidden_states).float() + self.dt_bias.float()
         )
 
-        core_output, final_state = gated_delta_rule_reference(
+        core_output, final_state = self._run_recurrence(
             query,
             key,
             value,

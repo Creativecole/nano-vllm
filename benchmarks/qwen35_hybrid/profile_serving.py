@@ -37,6 +37,8 @@ PROFILE_RANGES = (
     "qwen35_deltanet_mixer",
     "qwen35_deltanet_conv",
     "qwen35_deltanet_recurrence",
+    "qwen35_deltanet_recurrence_sequential",
+    "qwen35_deltanet_recurrence_chunked",
     "qwen35_deltanet_output",
     "qwen35_mlp",
     "qwen35_metadata_prepare",
@@ -68,6 +70,12 @@ def parse_args():
     parser.add_argument("--decode-steps", default="32,128")
     parser.add_argument("--phases", default="prefill,decode,continuous")
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument(
+        "--deltanet-backend",
+        choices=("sequential", "chunked"),
+        default="sequential",
+    )
+    parser.add_argument("--deltanet-chunk-size", type=int, default=64)
     parser.add_argument("--record-shapes", action="store_true")
     parser.add_argument("--profile-memory", action="store_true")
     parser.add_argument(
@@ -360,6 +368,8 @@ def matrix_spec(args):
         "warmup": args.warmup,
         "record_shapes": args.record_shapes,
         "profile_memory": args.profile_memory,
+        "deltanet_backend": args.deltanet_backend,
+        "deltanet_chunk_size": args.deltanet_chunk_size,
     }
 
 
@@ -458,6 +468,8 @@ def profile_matrix(args, facts, spec, rows):
         hybrid_state_capacity=max(batch_sizes),
         max_model_len=max(prompt_lens) + max(decode_steps) + 1,
         max_num_batched_tokens=max(batch_sizes) * max(prompt_lens),
+        deltanet_backend=args.deltanet_backend,
+        deltanet_chunk_size=args.deltanet_chunk_size,
     )
     failures = []
     trace_dir = Path(args.trace_dir)
@@ -467,7 +479,10 @@ def profile_matrix(args, facts, spec, rows):
                 for decode in decode_steps:
                     case = (batch_size, prompt_len, decode)
                     for phase in phases:
-                        label = f"b{batch_size}_p{prompt_len}_d{decode}_{phase}"
+                        label = (
+                            f"{args.deltanet_backend}_b{batch_size}_"
+                            f"p{prompt_len}_d{decode}_{phase}"
+                        )
                         trace_path = trace_dir / f"{label}.json"
                         key = (batch_size, prompt_len, decode, phase)
                         if key in completed:
@@ -484,6 +499,8 @@ def profile_matrix(args, facts, spec, rows):
                                     "prompt_len": prompt_len,
                                     "decode_steps": decode,
                                     "phase": phase,
+                                    "deltanet_backend": args.deltanet_backend,
+                                    "deltanet_chunk_size": args.deltanet_chunk_size,
                                     "trace": str(trace_path),
                                     **summary,
                                 }
@@ -532,6 +549,8 @@ def run_target(args):
         hybrid_state_capacity=args.target_batch,
         max_model_len=args.target_prompt + args.target_decode + 1,
         max_num_batched_tokens=args.target_batch * args.target_prompt,
+        deltanet_backend=args.deltanet_backend,
+        deltanet_chunk_size=args.deltanet_chunk_size,
     )
     try:
         case = (args.target_batch, args.target_prompt, args.target_decode)
@@ -585,9 +604,12 @@ def derive_answers(rows):
             category_totals[name] += value
         for kernel in row["top_kernels"]:
             kernel_totals[kernel["name"]] += kernel["self_cuda_time_ms"]
-        recurrence = row["range_attribution"].get(
-            "qwen35_deltanet_recurrence", {}
-        )
+        ranges = row["range_attribution"]
+        recurrence = ranges.get("qwen35_deltanet_recurrence_chunked", {})
+        if not recurrence:
+            recurrence = ranges.get("qwen35_deltanet_recurrence_sequential", {})
+        if not recurrence:
+            recurrence = ranges.get("qwen35_deltanet_recurrence", {})
         phase_total = phase_totals[row["phase"]]
         phase_total["profiles"] += 1
         phase_total["wall_time_s"] += row["wall_time_s"]
@@ -911,6 +933,8 @@ should then target only the one or two hottest concrete kernels listed above.
 
 def main():
     args = parse_args()
+    if args.deltanet_chunk_size <= 0:
+        raise ValueError("--deltanet-chunk-size must be positive")
     if args.target_only:
         run_target(args)
         return

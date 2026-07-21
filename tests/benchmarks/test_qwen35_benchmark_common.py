@@ -1,7 +1,10 @@
 import pytest
 import torch
 
-from benchmarks.qwen35_hybrid.bench_e2e import aggregate_rows
+from benchmarks.qwen35_hybrid.bench_e2e import (
+    aggregate_rows,
+    compare_deltanet_backends,
+)
 from benchmarks.qwen35_hybrid.common import (
     parse_int_list,
     percentile,
@@ -69,3 +72,32 @@ def test_e2e_aggregation_preserves_mean_p50_p95():
     assert summary["elapsed_s_mean"] == 2.0
     assert summary["elapsed_s_p50"] == 2.0
     assert summary["elapsed_s_p95"] == pytest.approx(2.9)
+
+
+def test_e2e_deltanet_comparison_separates_ttft_decode_and_memory():
+    base = {
+        "batch_size": 1,
+        "prompt_len": 512,
+        "output_len": 32,
+    }
+    comparison = compare_deltanet_backends(
+        [
+            {
+                **base,
+                "backend": "nanovllm_sequential",
+                "ttft_s_mean": 2.0,
+                "decode_tokens_per_s_mean": 100.0,
+                "peak_memory_gb_mean": 20.0,
+            },
+            {
+                **base,
+                "backend": "nanovllm_chunked",
+                "ttft_s_mean": 1.0,
+                "decode_tokens_per_s_mean": 99.0,
+                "peak_memory_gb_mean": 21.5,
+            },
+        ]
+    )[0]
+    assert comparison["ttft_speedup"] == 2.0
+    assert comparison["decode_throughput_ratio"] == 0.99
+    assert comparison["peak_memory_delta_gb"] == 1.5

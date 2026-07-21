@@ -44,3 +44,21 @@ def test_no_cache_forward_accepts_rank_one_input(hf_tiny_config):
         logits = model.forward_logits(input_ids)
     assert logits.shape == (5, hf_tiny_config.vocab_size)
     assert torch.isfinite(logits).all()
+
+
+def test_chunked_no_cache_logits_match_sequential(hf_tiny_config):
+    torch.manual_seed(47)
+    hf_tiny_config.nanovllm_deltanet_backend = "sequential"
+    sequential = Qwen3_5ForCausalLM(hf_tiny_config).eval()
+    hf_tiny_config.nanovllm_deltanet_backend = "chunked"
+    hf_tiny_config.nanovllm_deltanet_chunk_size = 4
+    chunked = Qwen3_5ForCausalLM(hf_tiny_config).eval()
+    chunked.load_state_dict(sequential.state_dict(), strict=True)
+    input_ids = torch.randint(1, hf_tiny_config.vocab_size, (2, 9))
+
+    with torch.no_grad():
+        expected = sequential.forward_logits(input_ids)
+        actual = chunked.forward_logits(input_ids)
+
+    assert torch.equal(actual[:, -1].argmax(-1), expected[:, -1].argmax(-1))
+    torch.testing.assert_close(actual, expected, rtol=5e-4, atol=5e-5)

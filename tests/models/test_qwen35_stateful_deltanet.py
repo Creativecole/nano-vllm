@@ -59,3 +59,39 @@ def test_stateful_batch_rows_do_not_share_recurrent_state(hf_tiny_config):
         layer._forward_stateful_chunk(hidden_states, state)
     assert not torch.equal(state.conv_state[0], state.conv_state[1])
     assert not torch.equal(state.recurrent_state[0], state.recurrent_state[1])
+
+
+@pytest.mark.parametrize("batch_size,seq_len", [(1, 7), (2, 17)])
+def test_chunked_stateful_prefill_matches_sequential(
+    hf_tiny_config, batch_size, seq_len
+):
+    torch.manual_seed(43)
+    hf_tiny_config.nanovllm_deltanet_backend = "sequential"
+    sequential = Qwen3_5GatedDeltaNet(hf_tiny_config, layer_idx=0).eval()
+    hf_tiny_config.nanovllm_deltanet_backend = "chunked"
+    hf_tiny_config.nanovllm_deltanet_chunk_size = 8
+    chunked = Qwen3_5GatedDeltaNet(hf_tiny_config, layer_idx=0).eval()
+    chunked.load_state_dict(sequential.state_dict(), strict=True)
+    hidden_states = torch.randn(batch_size, seq_len, hf_tiny_config.hidden_size)
+    sequential_state = make_zero_state(sequential, batch_size, hidden_states.dtype)
+    chunked_state = make_zero_state(chunked, batch_size, hidden_states.dtype)
+
+    with torch.no_grad():
+        expected = sequential._forward_stateful_chunk(
+            hidden_states, sequential_state
+        )
+        actual = chunked._forward_stateful_chunk(hidden_states, chunked_state)
+
+    torch.testing.assert_close(actual, expected, rtol=3e-4, atol=3e-5)
+    torch.testing.assert_close(
+        chunked_state.conv_state,
+        sequential_state.conv_state,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        chunked_state.recurrent_state,
+        sequential_state.recurrent_state,
+        rtol=3e-4,
+        atol=3e-5,
+    )
