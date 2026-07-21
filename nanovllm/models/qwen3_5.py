@@ -521,6 +521,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             raise ValueError(f"Unsupported DeltaNet backend {self.deltanet_backend!r}")
         if self.deltanet_chunk_size <= 0:
             raise ValueError("DeltaNet chunk size must be positive")
+        self._diagnostics_enabled = False
+        self.reset_diagnostics()
 
         self.conv1d = nn.Conv1d(
             self.conv_dim,
@@ -539,6 +541,29 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
+    def set_diagnostics(self, enabled: bool, reset: bool = True) -> None:
+        self._diagnostics_enabled = bool(enabled)
+        if reset:
+            self.reset_diagnostics()
+
+    def reset_diagnostics(self) -> None:
+        self._diagnostics = {
+            "layer_idx": self.layer_idx,
+            "recurrence_calls": 0,
+            "equal_length_batched_prefill_calls": 0,
+            "variable_length_fallback_calls": 0,
+            "fallback_sequences": 0,
+            "calls": [],
+        }
+
+    def get_diagnostics(self) -> dict[str, object]:
+        return {
+            key: [dict(item) for item in value]
+            if key == "calls"
+            else value
+            for key, value in self._diagnostics.items()
+        }
+
     def _run_recurrence(
         self,
         query: torch.Tensor,
@@ -550,6 +575,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         use_chunked = self.deltanet_backend == "chunked" and query.shape[1] > 1
         backend = "chunked" if use_chunked else "sequential"
+        if self._diagnostics_enabled:
+            context = get_context()
+            self._diagnostics["recurrence_calls"] += 1
+            self._diagnostics["calls"].append(
+                {
+                    "backend": backend,
+                    "is_prefill": context.is_prefill,
+                    "query_shape": list(query.shape),
+                    "key_shape": list(key.shape),
+                    "value_shape": list(value.shape),
+                    "state_shape": list(initial_state.shape)
+                    if initial_state is not None
+                    else None,
+                    "query_dtype": str(query.dtype),
+                    "state_dtype": str(initial_state.dtype)
+                    if initial_state is not None
+                    else None,
+                }
+            )
         with profile_range(f"qwen35_deltanet_recurrence_{backend}"):
             if use_chunked:
                 return chunked_gated_delta_rule_reference(
@@ -635,7 +679,34 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if context.is_prefill:
             if context.prefill_seq_lens is None:
                 raise RuntimeError("Packed prefill is missing sequence lengths")
-            chunks = hidden_states.split(context.prefill_seq_lens, dim=0)
+            seq_lens = context.prefill_seq_lens
+            batch_size = len(seq_lens)
+            equal_length = len(set(seq_lens)) == 1
+            if self.deltanet_backend == "chunked" and equal_length:
+                seq_len = seq_lens[0]
+                if hidden_states.shape[0] != batch_size * seq_len:
+                    raise ValueError(
+                        "Packed prefill token count does not match equal-length batch: "
+                        f"tokens={hidden_states.shape[0]}, batch={batch_size}, "
+                        f"seq_len={seq_len}"
+                    )
+                if layer_state.conv_state.shape[0] != batch_size:
+                    raise ValueError(
+                        "DeltaNet state batch does not match packed prefill batch: "
+                        f"state={layer_state.conv_state.shape[0]}, batch={batch_size}"
+                    )
+                if self._diagnostics_enabled:
+                    self._diagnostics["equal_length_batched_prefill_calls"] += 1
+                batched = hidden_states.reshape(
+                    batch_size, seq_len, hidden_states.shape[-1]
+                )
+                output = self._forward_stateful_chunk(batched, layer_state)
+                return output.reshape(-1, output.shape[-1])
+
+            if self._diagnostics_enabled:
+                self._diagnostics["variable_length_fallback_calls"] += 1
+                self._diagnostics["fallback_sequences"] += batch_size
+            chunks = hidden_states.split(seq_lens, dim=0)
             outputs = []
             for batch_idx, chunk in enumerate(chunks):
                 request_state = DeltaNetState(
@@ -788,6 +859,23 @@ class Qwen3_5Model(nn.Module):
         self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3_5RotaryEmbedding(config)
 
+    def set_deltanet_diagnostics(self, enabled: bool, reset: bool = True) -> None:
+        for layer in self.layers:
+            if layer.block_type == "linear_attention":
+                layer.linear_attn.set_diagnostics(enabled, reset=reset)
+
+    def reset_deltanet_diagnostics(self) -> None:
+        for layer in self.layers:
+            if layer.block_type == "linear_attention":
+                layer.linear_attn.reset_diagnostics()
+
+    def get_deltanet_diagnostics(self) -> dict[int, dict[str, object]]:
+        return {
+            layer.layer_idx: layer.linear_attn.get_diagnostics()
+            for layer in self.layers
+            if layer.block_type == "linear_attention"
+        }
+
     def _normalize_positions(
         self,
         input_ids: torch.Tensor,
@@ -894,6 +982,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         if context.is_prefill and hidden_states.ndim == 2:
             hidden_states = hidden_states[context.cu_seqlens_q[1:] - 1].contiguous()
         return self.lm_head(hidden_states)
+
+    def set_deltanet_diagnostics(self, enabled: bool, reset: bool = True) -> None:
+        self.model.set_deltanet_diagnostics(enabled, reset=reset)
+
+    def reset_deltanet_diagnostics(self) -> None:
+        self.model.reset_deltanet_diagnostics()
+
+    def get_deltanet_diagnostics(self) -> dict[int, dict[str, object]]:
+        return self.model.get_deltanet_diagnostics()
 
     def get_layer_state_specs(self) -> list[PagedKVStateSpec | DeltaNetStateSpec]:
         parameter_dtype = self.model.embed_tokens.weight.dtype

@@ -82,3 +82,27 @@ def test_state_bytes_are_derived_from_spec():
     expected = 16 * 4 * torch.bfloat16.itemsize
     expected += 4 * 8 * 8 * torch.float32.itemsize
     assert delta_state_bytes_per_sequence([spec]) == expected
+
+
+def test_state_manager_diagnostics_report_batched_state_movement():
+    specs = [make_spec(3), make_spec(7)]
+    manager = HybridStateManager(specs, capacity=4, device="cpu")
+    seq_ids = [10, 20, 30, 40]
+    manager.allocate(seq_ids)
+    manager.set_diagnostics(True)
+
+    states = manager.gather(seq_ids)
+    manager.commit(states)
+
+    stats = manager.get_diagnostics()
+    expected_bytes = len(seq_ids) * delta_state_bytes_per_sequence(specs)
+    assert stats == {
+        "gather_calls": 1,
+        "gather_layer_ops": 2,
+        "gather_bytes": expected_bytes,
+        "commit_calls": 1,
+        "commit_layer_ops": 2,
+        "commit_bytes": expected_bytes,
+        "slot_id_upload_bytes": len(seq_ids) * torch.long.itemsize,
+        "batch_sizes": [4],
+    }

@@ -381,6 +381,31 @@ class ModelRunner:
         if self.hybrid_state_manager is not None:
             self.hybrid_state_manager.free(seq_ids)
 
+    def set_deltanet_diagnostics(
+        self, enabled: bool, reset: bool = True
+    ) -> None:
+        configure = getattr(self.model, "set_deltanet_diagnostics", None)
+        if configure is None or self.hybrid_state_manager is None:
+            raise RuntimeError("DeltaNet diagnostics require a hybrid Qwen3.5 model")
+        configure(enabled, reset=reset)
+        self.hybrid_state_manager.set_diagnostics(enabled, reset=reset)
+
+    def reset_deltanet_diagnostics(self) -> None:
+        reset = getattr(self.model, "reset_deltanet_diagnostics", None)
+        if reset is None or self.hybrid_state_manager is None:
+            raise RuntimeError("DeltaNet diagnostics require a hybrid Qwen3.5 model")
+        reset()
+        self.hybrid_state_manager.reset_diagnostics()
+
+    def get_deltanet_diagnostics(self) -> dict[str, object]:
+        collect = getattr(self.model, "get_deltanet_diagnostics", None)
+        if collect is None or self.hybrid_state_manager is None:
+            raise RuntimeError("DeltaNet diagnostics require a hybrid Qwen3.5 model")
+        return {
+            "layers": collect(),
+            "state_manager": self.hybrid_state_manager.get_diagnostics(),
+        }
+
     def get_hybrid_state_stats(self):
         if self.hybrid_state_manager is None:
             return None

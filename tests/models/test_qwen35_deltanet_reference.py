@@ -28,7 +28,16 @@ def test_sequential_delta_rule_state_shape_and_finiteness():
 
 @pytest.mark.parametrize(
     "batch_size,seq_len,chunk_size",
-    [(1, 1, 8), (2, 7, 8), (1, 16, 8), (1, 17, 8), (2, 65, 64)],
+    [
+        (1, 1, 64),
+        (2, 31, 64),
+        (4, 64, 64),
+        (2, 65, 64),
+        (1, 127, 64),
+        (2, 128, 64),
+        (1, 129, 64),
+        (1, 512, 64),
+    ],
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_chunked_delta_rule_matches_sequential_reference(

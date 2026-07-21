@@ -49,9 +49,11 @@ about 0.49 kernels per input token.
 | 4 | 3,671.90 ms | 215.76 ms | 17.02x | 82,206 | 4,042 | 95.08% |
 | 8 | 7,121.26 ms | 408.42 ms | 17.44x | 164,410 | 8,082 | 95.08% |
 
-Kernel count still scales with packed request count because the serving prefill path
-processes each request's independent DeltaNet state separately. The important change is
-that each request now scales by chunks rather than by token-level recurrence launches.
+These measurements predate the equal-length batched prefill fast path. They exposed the
+next execution issue: the packed serving path called the chunked recurrence once per
+request per DeltaNet layer, so kernel count still scaled with packed request count.
+The follow-up batched implementation and its validation method are documented in
+`08_batched_chunked_prefill.md`.
 
 ## End-To-End Effect
 
