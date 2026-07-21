@@ -14,7 +14,7 @@ The two projects intentionally remain on separate branches:
 
 | Branch | Focus |
 |---|---|
-| [`feature/qwen35-hybrid-serving`](https://github.com/Creativecole/nano-vllm/tree/feature/qwen35-hybrid-serving) | **This project:** Qwen3.5-9B hybrid state, DeltaNet prefill, continuous batching, profiling |
+| [`qwen35-hybrid`](https://github.com/Creativecole/nano-vllm/tree/qwen35-hybrid) | **This project:** Qwen3.5-9B hybrid state, DeltaNet prefill, continuous batching, profiling |
 | [`main`](https://github.com/Creativecole/nano-vllm/tree/main) | Qwen3-4B decode-only Triton PagedAttention backend |
 
 ## Results
@@ -143,7 +143,7 @@ The optimized path is selected explicitly with `deltanet_backend="chunked"`.
 ### Installation
 
 ```bash
-git clone --branch feature/qwen35-hybrid-serving \
+git clone --branch qwen35-hybrid \
   https://github.com/Creativecole/nano-vllm.git
 cd nano-vllm
 pip install -e .
