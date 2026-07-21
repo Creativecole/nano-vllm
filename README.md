@@ -1,66 +1,285 @@
-<p align="center">
-<img width="300" src="assets/logo.png">
-</p>
+# Qwen3.5-9B Hybrid Serving on RTX 5090
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+A text-only Qwen3.5 hybrid inference backend built inside nano-vLLM. It combines
+Paged KV Cache for Full Attention layers with request-scoped convolution and recurrent
+state for Gated DeltaNet layers, then optimizes prefill from token-level recurrence to
+chunked and truly batched execution.
 
-# Nano-vLLM
+The measured implementation runs Qwen3.5-9B in BF16 on one NVIDIA RTX 5090. It does
+not use quantization, a custom Triton kernel, or CUDA Graphs for these results.
 
-A lightweight vLLM implementation built from scratch.
+## Project Branches
 
-## Key Features
+The two projects intentionally remain on separate branches:
 
-* 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
-* 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+| Branch | Focus |
+|---|---|
+| [`feature/qwen35-hybrid-serving`](https://github.com/Creativecole/nano-vllm/tree/feature/qwen35-hybrid-serving) | **This project:** Qwen3.5-9B hybrid state, DeltaNet prefill, continuous batching, profiling |
+| [`main`](https://github.com/Creativecole/nano-vllm/tree/main) | Qwen3-4B decode-only Triton PagedAttention backend |
 
-## Installation
+## Results
 
-```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+Measured with Qwen3.5-9B, BF16, eager mode, one RTX 5090, warmup 2, repeat 3, and
+128 generated tokens. Hugging Face and nano-vLLM run in isolated processes. The HF
+runtime was verified to use `causal_conv1d_fn` and FLA
+`chunk_gated_delta_rule` during prefill.
+
+### End-to-End Serving
+
+| Batch | Prompt | HF TTFT | nano-vLLM TTFT | HF decode tok/s | nano-vLLM decode tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 128 | 176.7 ms | **169.9 ms** | 20.93 | **24.15** |
+| 1 | 512 | 214.5 ms | **200.5 ms** | 20.87 | **24.37** |
+| 1 | 2048 | 360.6 ms | **331.4 ms** | 20.84 | **24.25** |
+| 4 | 128 | 181.5 ms | **175.3 ms** | 82.24 | **95.28** |
+| 4 | 512 | 240.8 ms | **235.0 ms** | 81.90 | **94.93** |
+| 4 | 2048 | 999.5 ms | **952.2 ms** | 81.88 | **94.92** |
+
+On this matrix, nano-vLLM is 2.4% to 8.1% lower in TTFT and about 16% higher in
+aggregate decode throughput than the measured HF eager baseline. These are runtime
+results for this exact model, GPU, and workload, not general claims across hardware.
+
+### Batched Prefill Optimization
+
+The first chunked implementation still split packed requests and called recurrence once
+per request per DeltaNet layer. The equal-length fast path now preserves the batch
+dimension and performs one batched recurrence call per layer.
+
+| Batch | Prompt | Before batched path | Batched path | Improvement |
+|---:|---:|---:|---:|---:|
+| 4 | 128 | 607 ms | **175.3 ms** | **3.46x** |
+| 4 | 512 | 739 ms | **235.0 ms** | **3.14x** |
+| 4 | 2048 | 1429 ms | **952.2 ms** | **1.50x** |
+
+Batch-1 TTFT stays effectively unchanged: 170.0 to 169.9 ms at prompt 128,
+201.0 to 200.5 ms at prompt 512, and 330.0 to 331.4 ms at prompt 2048. The earlier
+baseline used repeat 2; the final table uses repeat 3, both after two warmups.
+
+### Why Chunked Recurrence
+
+The original correctness-first recurrence loop launched roughly ten CUDA kernels per
+input token. A PyTorch chunked Gated Delta Rule keeps the same equations and FP32 state
+accumulation but evaluates within-chunk dependencies with batched matrix operations.
+
+Single DeltaNet layer, batch 1:
+
+| Prompt | Sequential CUDA | Chunked CUDA | Sequential kernels | Chunked kernels | CUDA speedup |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 57.23 ms | 22.92 ms | 1,338 | 502 | 2.50x |
+| 512 | 222.24 ms | 29.50 ms | 5,181 | 604 | 7.53x |
+| 2048 | 889.79 ms | 75.62 ms | 20,553 | 1,012 | 11.77x |
+
+At prompt 2048, chunking removes about 95% of the layer-level kernel launches. This is
+an execution-model optimization implemented with PyTorch operations, not a fused Triton
+kernel claim.
+
+## Architecture
+
+Qwen3.5-9B text configuration:
+
+- 32 decoder layers with pattern `[DeltaNet, DeltaNet, DeltaNet, Full Attention] x 8`
+- 24 Gated DeltaNet layers and 8 Full Attention layers
+- Full Attention: 16 query heads, 4 KV heads, head dimension 256
+- DeltaNet: 16 key heads, 32 value heads, key/value head dimension 128
+- Causal convolution width 4
+- Hidden size 4096, MLP intermediate size 12288
+- BF16 model tensors with FP32 recurrent-state accumulation
+
+### Hybrid Cache
+
+Full Attention layers use nano-vLLM's paged KV blocks and block tables. DeltaNet layers
+use a separate fixed-slot state pool indexed by request ID:
+
+```text
+PagedKVState  = K/V blocks for 8 Full Attention layers
+DeltaNetState = conv_state + recurrent_state for 24 DeltaNet layers
 ```
 
-## Model Download
+The scheduler accounts token capacity with Full Attention KV blocks. DeltaNet state is
+allocated independently per active request, gathered in active batch order, committed
+after each model step, reordered during batch compaction, and released when the request
+finishes.
 
-To download the model weights manually, use the following command:
-```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
+For Qwen3.5-9B, active DeltaNet state is about 49.5 MiB per request. nano-vLLM also
+preallocates a large KV cache pool, so its reported peak GPU allocation is higher than
+HF eager and should not be interpreted as prompt-specific live KV usage.
+
+## Implementation
+
+### Model Integration
+
+- model registry removes the original hard-coded Qwen3 model construction
+- outer `Qwen3_5Config` and nested text config are handled separately
+- layer construction follows the checkpoint's `layer_types`
+- Full Attention includes GQA, attention gate, partial RoPE, and paged KV execution
+- Gated DeltaNet includes projections, causal convolution, decay/gate, recurrent state,
+  gated normalization, and output projection
+- strict weight loading reports loaded, missing, duplicate, unexpected, and intentionally
+  skipped non-text weights
+
+### Prefill and Decode
+
+```text
+Prefill
+  packed requests
+    -> Full Attention: paged/varlen attention
+    -> DeltaNet: chunked recurrence
+    -> equal-length batch: one [B, T, ...] recurrence call per layer
+    -> variable length: correctness-first per-sequence fallback
+
+Decode
+  one token per active request
+    -> Full Attention: paged KV read/write
+    -> DeltaNet: sequential recurrent-state update
 ```
+
+The `sequential` DeltaNet backend remains available as the reference implementation.
+The optimized path is selected explicitly with `deltanet_backend="chunked"`.
 
 ## Quick Start
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
-```python
-from nanovllm import LLM, SamplingParams
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
-outputs[0]["text"]
+### Installation
+
+```bash
+git clone --branch feature/qwen35-hybrid-serving \
+  https://github.com/Creativecole/nano-vllm.git
+cd nano-vllm
+pip install -e .
 ```
 
-## Benchmark
+The measured environment used Python 3.11, PyTorch 2.12.0+cu130, CUDA 13.0,
+Transformers 5.10.2, and FlashAttention on an RTX 5090.
 
-See `bench.py` for benchmark.
+Download the model:
 
-**Test Configuration:**
-- Hardware: RTX 4070 Laptop (8GB)
-- Model: Qwen3-0.6B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100–1024 tokens
-- Output Length: Randomly sampled between 100–1024 tokens
+```bash
+hf download Qwen/Qwen3.5-9B --local-dir ../models/Qwen3.5-9B
+```
 
-**Performance Results:**
-| Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
-|----------------|-------------|----------|-----------------------|
-| vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
+Run generation:
 
+```python
+from nanovllm import LLM, SamplingParams
 
-## Star History
+llm = LLM(
+    "../models/Qwen3.5-9B",
+    enforce_eager=True,
+    max_num_seqs=4,
+    hybrid_state_capacity=4,
+    deltanet_backend="chunked",
+    deltanet_chunk_size=64,
+)
+outputs = llm.generate(
+    [[1, 2, 3, 4]],
+    SamplingParams(temperature=0.0, max_tokens=128, ignore_eos=True),
+    use_tqdm=False,
+)
+llm.exit()
+```
 
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+## Reproduce
+
+### Correctness
+
+```bash
+pytest -q \
+  tests/engine/test_hybrid_state_manager.py \
+  tests/models/test_qwen35_deltanet_reference.py \
+  tests/models/test_qwen35_stateful_deltanet.py \
+  tests/models/test_qwen35_hybrid_execution.py
+
+python benchmarks/qwen35_hybrid/validate_correctness.py \
+  --model ../models/Qwen3.5-9B \
+  --deltanet-backend chunked \
+  --deltanet-chunk-size 64 \
+  --prompt-lens 1,16,128,512 \
+  --batch-sizes 1,2,4 \
+  --decode-steps 1,8,32
+```
+
+### Batched Prefill Diagnosis
+
+```bash
+python benchmarks/qwen35_hybrid/diagnose_batched_prefill.py \
+  --model ../models/Qwen3.5-9B \
+  --cases 1x128,4x128,4x512 \
+  --deltanet-chunk-size 64 \
+  --warmup 1
+```
+
+For an equal-length batch-4 case, every DeltaNet layer should report one recurrence
+call and a recurrence input whose first dimension is 4.
+
+### End-to-End Benchmark
+
+```bash
+python benchmarks/qwen35_hybrid/bench_e2e.py \
+  --model ../models/Qwen3.5-9B \
+  --backends hf,nanovllm_chunked \
+  --batch-sizes 1,4 \
+  --prompt-lens 128,512,2048 \
+  --output-lens 128 \
+  --warmup 2 \
+  --repeat 5 \
+  --deltanet-chunk-size 64 \
+  --save-json benchmarks/qwen35_hybrid/results/e2e_batched_chunked.json \
+  --save-md docs/qwen35_hybrid/e2e_batched_chunked.md
+```
+
+### Profiler and Nsight
+
+```bash
+python benchmarks/qwen35_hybrid/profile_layers.py \
+  --model ../models/Qwen3.5-9B \
+  --layer-id 0 \
+  --batch-size 1 \
+  --prompt-len 2048 \
+  --deltanet-backends sequential,chunked \
+  --deltanet-chunk-size 64 \
+  --profile-memory
+
+python benchmarks/qwen35_hybrid/run_nsight.py \
+  --tool nsys \
+  --model ../models/Qwen3.5-9B \
+  --phase prefill \
+  --batch-size 1 \
+  --prompt-len 2048 \
+  --decode-steps 1 \
+  --deltanet-backend chunked
+```
+
+## Project Layout
+
+```text
+nanovllm/
+  models/qwen3_5.py          # Full Attention + Gated DeltaNet model
+  engine/layer_state.py      # Paged KV and request-scoped DeltaNet state
+  engine/model_runner.py     # hybrid cache allocation and execution
+  models/registry.py         # model dispatch
+
+benchmarks/qwen35_hybrid/
+  validate_checkpoint.py
+  validate_correctness.py
+  diagnose_batched_prefill.py
+  bench_e2e.py
+  profile_layers.py
+  profile_serving.py
+  run_nsight.py
+
+docs/qwen35_hybrid/          # design, correctness, profiler, and optimization notes
+tests/                       # model, state lifecycle, scheduler, and benchmark tests
+```
+
+## Scope
+
+- text-only Qwen3.5 serving, tensor parallel size 1
+- chunked optimization targets prefill; single-token decode keeps sequential recurrence
+- equal-length prompts use the batched fast path; variable-length packed prompts keep a
+  correctness-first fallback
+- Prefix Cache, CUDA Graph, quantization, and fused Triton DeltaNet kernels are not part
+  of the reported result
+- performance numbers are specific to Qwen3.5-9B BF16 on one RTX 5090
+
+## License
+
+MIT
