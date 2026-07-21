@@ -179,77 +179,6 @@ outputs = llm.generate(
 llm.exit()
 ```
 
-## Reproduce
-
-### Correctness
-
-```bash
-pytest -q \
-  tests/engine/test_hybrid_state_manager.py \
-  tests/models/test_qwen35_deltanet_reference.py \
-  tests/models/test_qwen35_stateful_deltanet.py \
-  tests/models/test_qwen35_hybrid_execution.py
-
-python benchmarks/qwen35_hybrid/validate_correctness.py \
-  --model ../models/Qwen3.5-9B \
-  --deltanet-backend chunked \
-  --deltanet-chunk-size 64 \
-  --prompt-lens 1,16,128,512 \
-  --batch-sizes 1,2,4 \
-  --decode-steps 1,8,32
-```
-
-### Batched Prefill Diagnosis
-
-```bash
-python benchmarks/qwen35_hybrid/diagnose_batched_prefill.py \
-  --model ../models/Qwen3.5-9B \
-  --cases 1x128,4x128,4x512 \
-  --deltanet-chunk-size 64 \
-  --warmup 1
-```
-
-For an equal-length batch-4 case, every DeltaNet layer should report one recurrence
-call and a recurrence input whose first dimension is 4.
-
-### End-to-End Benchmark
-
-```bash
-python benchmarks/qwen35_hybrid/bench_e2e.py \
-  --model ../models/Qwen3.5-9B \
-  --backends hf,nanovllm_chunked \
-  --batch-sizes 1,4 \
-  --prompt-lens 128,512,2048 \
-  --output-lens 128 \
-  --warmup 2 \
-  --repeat 5 \
-  --deltanet-chunk-size 64 \
-  --save-json benchmarks/qwen35_hybrid/results/e2e_batched_chunked.json \
-  --save-md docs/qwen35_hybrid/e2e_batched_chunked.md
-```
-
-### Profiler and Nsight
-
-```bash
-python benchmarks/qwen35_hybrid/profile_layers.py \
-  --model ../models/Qwen3.5-9B \
-  --layer-id 0 \
-  --batch-size 1 \
-  --prompt-len 2048 \
-  --deltanet-backends sequential,chunked \
-  --deltanet-chunk-size 64 \
-  --profile-memory
-
-python benchmarks/qwen35_hybrid/run_nsight.py \
-  --tool nsys \
-  --model ../models/Qwen3.5-9B \
-  --phase prefill \
-  --batch-size 1 \
-  --prompt-len 2048 \
-  --decode-steps 1 \
-  --deltanet-backend chunked
-```
-
 ## Project Layout
 
 ```text
@@ -271,16 +200,6 @@ benchmarks/qwen35_hybrid/
 docs/qwen35_hybrid/          # design, correctness, profiler, and optimization notes
 tests/                       # model, state lifecycle, scheduler, and benchmark tests
 ```
-
-## Scope
-
-- text-only Qwen3.5 serving, tensor parallel size 1
-- chunked optimization targets prefill; single-token decode keeps sequential recurrence
-- equal-length prompts use the batched fast path; variable-length packed prompts keep a
-  correctness-first fallback
-- Prefix Cache, CUDA Graph, quantization, and fused Triton DeltaNet kernels are not part
-  of the reported result
-- performance numbers are specific to Qwen3.5-9B BF16 on one RTX 5090
 
 ## License
 
