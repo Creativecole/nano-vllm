@@ -42,6 +42,7 @@ PROFILE_RANGES = (
     "qwen35_deltanet_output",
     "qwen35_mlp",
     "qwen35_metadata_prepare",
+    "qwen35_state_resident_view",
     "qwen35_state_gather",
     "qwen35_state_commit",
 )
@@ -76,6 +77,11 @@ def parse_args():
         default="sequential",
     )
     parser.add_argument("--deltanet-chunk-size", type=int, default=64)
+    parser.add_argument(
+        "--disable-resident-deltanet-state",
+        action="store_true",
+        help="Profile the materialized state gather/commit fallback.",
+    )
     parser.add_argument("--record-shapes", action="store_true")
     parser.add_argument("--profile-memory", action="store_true")
     parser.add_argument(
@@ -370,6 +376,9 @@ def matrix_spec(args):
         "profile_memory": args.profile_memory,
         "deltanet_backend": args.deltanet_backend,
         "deltanet_chunk_size": args.deltanet_chunk_size,
+        "resident_deltanet_state": (
+            not args.disable_resident_deltanet_state
+        ),
     }
 
 
@@ -468,6 +477,7 @@ def profile_matrix(args, facts, spec, rows):
         hybrid_state_capacity=max(batch_sizes),
         max_model_len=max(prompt_lens) + max(decode_steps) + 1,
         max_num_batched_tokens=max(batch_sizes) * max(prompt_lens),
+        resident_deltanet_state=not args.disable_resident_deltanet_state,
         deltanet_backend=args.deltanet_backend,
         deltanet_chunk_size=args.deltanet_chunk_size,
     )
@@ -549,6 +559,7 @@ def run_target(args):
         hybrid_state_capacity=args.target_batch,
         max_model_len=args.target_prompt + args.target_decode + 1,
         max_num_batched_tokens=args.target_batch * args.target_prompt,
+        resident_deltanet_state=not args.disable_resident_deltanet_state,
         deltanet_backend=args.deltanet_backend,
         deltanet_chunk_size=args.deltanet_chunk_size,
     )
@@ -587,6 +598,7 @@ def derive_answers(rows):
             "state_gather_cpu_ms": 0.0,
             "state_commit_cuda_ms": 0.0,
             "state_commit_cpu_ms": 0.0,
+            "state_resident_cpu_ms": 0.0,
             "recurrence_cuda_ms": 0.0,
             "recurrence_calls": 0,
         }
@@ -625,6 +637,9 @@ def derive_answers(rows):
             values = row["range_attribution"].get(range_name, {})
             phase_total[f"{prefix}_cuda_ms"] += values.get("cuda_total_ms", 0.0)
             phase_total[f"{prefix}_cpu_ms"] += values.get("cpu_total_ms", 0.0)
+        phase_total["state_resident_cpu_ms"] += ranges.get(
+            "qwen35_state_resident_view", {}
+        ).get("cpu_total_ms", 0.0)
         phase_total["recurrence_cuda_ms"] += recurrence.get("cuda_total_ms", 0.0)
         phase_total["recurrence_calls"] += recurrence.get("calls", 0)
         trend_rows.append(
@@ -848,6 +863,7 @@ def render_markdown(payload):
             "CUDA runtime self CPU ms",
             "state gather CUDA ms",
             "state commit CUDA ms",
+            "resident state view CPU ms",
             "recurrence us/call",
         ],
         [
@@ -861,6 +877,7 @@ def render_markdown(payload):
                 row["runtime_self_cpu_ms"],
                 row["state_gather_cuda_ms"],
                 row["state_commit_cuda_ms"],
+                row["state_resident_cpu_ms"],
                 row["recurrence_avg_us"],
             ]
             for row in answers["phase_summary"]

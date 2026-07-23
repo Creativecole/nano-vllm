@@ -18,11 +18,12 @@ Expected chunked-reference validation outputs:
 - `deltanet_backend_profile.json`: sequential/chunked layer CUDA time, kernel count,
   and temporary-memory comparison.
 - `chunked_e2e.json`: isolated-process TTFT, decode, and peak-memory comparison.
-- `chunked_recurrence_summary.json`: compact RTX 5090 layer-profile and E2E results
-  derived from the completed sequential/chunked runs.
 
-The final interpretation and Nsight capture commands are documented in
-`docs/qwen35_hybrid/07_chunked_recurrence_final.md`.
+Resident-state validation:
+
+- `resident_state_validation.md`: low-load online A/B and fixed-shape profiler summary.
+- Raw serving and profiler JSON files are intentionally kept outside Git unless needed
+  to reproduce a published table; large profiler traces remain local artifacts.
 
 The generated human-readable summary is
 `docs/qwen35_hybrid/05_profile_analysis.md`. Large raw traces should be archived for

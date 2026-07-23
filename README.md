@@ -75,6 +75,39 @@ At prompt 2048, chunking removes about 95% of the layer-level kernel launches. T
 an execution-model optimization implemented with PyTorch operations, not a fused Triton
 kernel claim.
 
+### Resident DeltaNet State
+
+The original correctness path gathered every active request's DeltaNet state before a
+model step and committed it afterward. The resident-state path keeps active requests in
+compact state slots and passes direct tensor views to the model, while retaining the
+gather/commit implementation as an A/B fallback.
+
+Open-loop mixed workload, one request/s, 60-second arrival window, seed 17:
+
+| State path | Completed | Rejected | TTFT p50 | TTFT p95 | ITL p95 | Output tok/s |
+|---|---:|---:|---:|---:|---:|---:|
+| Gather/commit fallback | 53 | 0 | 858.4 ms | 3693.2 ms | 44.29 ms | 90.61 |
+| Resident state | 53 | 0 | **818.9 ms** | **3619.8 ms** | **44.02 ms** | 90.66 |
+
+Throughput is effectively unchanged in this run. The useful result is the removal of
+state materialization rather than a broad serving-speed claim. In a fixed
+batch-4/prompt-512/64-step continuous profile:
+
+| Profiler metric | Gather/commit | Resident |
+|---|---:|---:|
+| State gather calls | 65 | 0 |
+| State commit calls | 65 | 0 |
+| `aten::index_select` calls | 3185 | **65** |
+| `aten::index_copy_` calls | 3120 | **0** |
+| CUDA launch calls | 210387 | **204051** |
+| Profile wall time | 22.863 s | **22.389 s** |
+
+The resident path removed 95.1 ms of attributed state gather/commit CUDA time in this
+profile, while total profile wall time decreased by 2.1%. This confirms that state
+movement was eliminated, but also shows that model execution remains the dominant
+bottleneck. Full details are in
+[`resident_state_validation.md`](benchmarks/qwen35_hybrid/results/resident_state_validation.md).
+
 ## Architecture
 
 Qwen3.5-9B text configuration:
@@ -98,9 +131,11 @@ DeltaNetState = conv_state + recurrent_state for 24 DeltaNet layers
 ```
 
 The scheduler accounts token capacity with Full Attention KV blocks. DeltaNet state is
-allocated independently per active request, gathered in active batch order, committed
-after each model step, reordered during batch compaction, and released when the request
-finishes.
+allocated independently per active request. The default resident path keeps active
+requests in compact slots and exposes direct state views to model execution. When a
+request finishes, the last active slot can be moved into the freed slot to preserve the
+compact layout. A materialized gather/commit path remains available for correctness and
+A/B debugging.
 
 For Qwen3.5-9B, active DeltaNet state is about 49.5 MiB per request. nano-vLLM also
 preallocates a large KV cache pool, so its reported peak GPU allocation is higher than
@@ -193,6 +228,8 @@ benchmarks/qwen35_hybrid/
   validate_correctness.py
   diagnose_batched_prefill.py
   bench_e2e.py
+  bench_serving.py
+  bench_resident_state_compare.py
   profile_layers.py
   profile_serving.py
   run_nsight.py
