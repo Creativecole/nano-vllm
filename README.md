@@ -75,6 +75,30 @@ At prompt 2048, chunking removes about 95% of the layer-level kernel launches. T
 an execution-model optimization implemented with PyTorch operations, not a fused Triton
 kernel claim.
 
+### Online Saturation Curve
+
+The open-loop serving harness submits a seeded mixed workload with bounded admission:
+80% chat requests, 20% long-context requests, at most 8 inflight requests and 32 queued
+requests. Each rate runs for a 60-second arrival window.
+
+| Request rate | Completed | Rejected | Input tok/s | Output tok/s | TTFT p50 | TTFT p95 | ITL p95 | Peak queue |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.5 req/s | 30 | 0 | 981.8 | 52.69 | 160 ms | 1148 ms | 31.70 ms | 0 |
+| 1 req/s | 53 | 0 | 1474.7 | 92.99 | 221 ms | 1745 ms | 32.57 ms | 3 |
+| 2 req/s | 115 | 0 | 2109.7 | 156.51 | 7720 ms | 20680 ms | 36.38 ms | 32 |
+| 4 req/s | 123 | 111 | 1954.7 | **168.78** | 19502 ms | 21943 ms | 33.66 ms | 32 |
+| 8 req/s | 120 | 337 | 2156.3 | 160.01 | 21562 ms | 24121 ms | 32.78 ms | 32 |
+
+The stable region is at or below one request/s. At two requests/s the pending queue
+reaches its limit and TTFT shows a clear saturation knee. Higher offered load does not
+materially increase output throughput; it increases rejection and queueing latency.
+ITL p95 remains around 32-36 ms, so overload appears primarily in request admission and
+prefill waiting rather than steady-state token spacing. The consistent sweep predates
+the resident-state cleanup; the later resident A/B reports throughput parity, so this
+table is used to characterize load shape rather than claim a resident-state speedup.
+See [`saturation_analysis.md`](benchmarks/qwen35_hybrid/results/saturation_analysis.md)
+for methodology and interpretation.
+
 ### Resident DeltaNet State
 
 The original correctness path gathered every active request's DeltaNet state before a
@@ -229,6 +253,7 @@ benchmarks/qwen35_hybrid/
   diagnose_batched_prefill.py
   bench_e2e.py
   bench_serving.py
+  bench_serving_sweep.py
   bench_resident_state_compare.py
   profile_layers.py
   profile_serving.py

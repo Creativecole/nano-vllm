@@ -22,6 +22,7 @@ Expected chunked-reference validation outputs:
 Resident-state validation:
 
 - `resident_state_validation.md`: low-load online A/B and fixed-shape profiler summary.
+- `saturation_analysis.md`: bounded open-loop request-rate curve and saturation point.
 - Raw serving and profiler JSON files are intentionally kept outside Git unless needed
   to reproduce a published table; large profiler traces remain local artifacts.
 
