@@ -75,6 +75,29 @@ At prompt 2048, chunking removes about 95% of the layer-level kernel launches. T
 an execution-model optimization implemented with PyTorch operations, not a fused Triton
 kernel claim.
 
+### Online Sequential vs Chunked A/B
+
+The online A/B uses the same seeded Poisson request trace for both backends. Each run
+uses a 120-second arrival window at 0.5 requests/s with the mixed workload and resident
+state enabled.
+
+| Seed | Offered | Sequential completed/rejected | Chunked completed/rejected | Sequential TTFT p95 | Chunked TTFT p95 | Output tok/s, seq -> chunk |
+|---:|---:|---:|---:|---:|---:|---:|
+| 17 | 53 | 53 / 0 | 53 / 0 | 166.66 s | **1.17 s** | 19.82 -> **47.71** |
+| 29 | 65 | 57 / 8 | 65 / 0 | 162.87 s | **1.25 s** | 22.46 -> **58.59** |
+| 43 | 66 | 66 / 0 | 66 / 0 | 74.61 s | **0.82 s** | 39.06 -> **65.26** |
+
+The correctness-first sequential recurrence cannot sustain this long-context request
+mix: its pending queue reaches 29-32 requests and draining takes 83-177 seconds.
+Chunked execution keeps the pending queue at 0-1 and drains in 1.6-4.5 seconds. Across
+the three seeds, TTFT p95 falls by 98.9-99.3% and output throughput increases
+1.67-2.61x, while ITL p95 remains around 43-45 ms because single-token decode still uses
+the sequential recurrent update. Chunked peak allocation is 0.64-0.69 GiB higher due to
+prefill temporaries. These numbers compare this project's sequential reference and
+chunked execution paths; they are not a claim against vLLM or another production
+runtime. Full results are in
+[`online_chunked_ab.md`](benchmarks/qwen35_hybrid/results/online_chunked_ab.md).
+
 ### Online Saturation Curve
 
 The open-loop serving harness submits a seeded mixed workload with bounded admission:
