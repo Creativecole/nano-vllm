@@ -6,6 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.scheduler import ScheduledRequest
 from nanovllm.engine.layer_state import (
     DeltaNetStateSpec,
     HybridStateManager,
@@ -30,6 +31,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.reset_execution_stats()
 
         model_class = get_model_class(config.hf_config, hf_config)
         if not getattr(model_class, "supports_cuda_graph", True):
@@ -198,6 +200,7 @@ class ModelRunner:
             delta_specs,
             capacity=state_capacity,
             device=torch.device("cuda", self.rank),
+            compact_slots=config.resident_deltanet_state,
         )
         paged_states = {}
         for spec in self.layer_state_specs:
@@ -312,6 +315,153 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
+    def prepare_mixed(
+        self,
+        requests: list[ScheduledRequest],
+    ) -> tuple[torch.Tensor, torch.Tensor, list[Sequence], list[int]]:
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        sample_indices = []
+        sample_seqs = []
+
+        decode_requests = [item for item in requests if not item.is_prefill]
+        prefill_requests = [item for item in requests if item.is_prefill]
+        if requests != decode_requests + prefill_requests:
+            raise ValueError(
+                "Unified execution requires decode requests before prefill requests"
+            )
+
+        decode_context_lens = []
+        for item in decode_requests:
+            seq = item.sequence
+            input_ids.append(seq.last_token)
+            positions.append(len(seq) - 1)
+            decode_context_lens.append(len(seq))
+            slot_mapping.append(
+                seq.block_table[-1] * self.block_size
+                + seq.last_block_num_tokens
+                - 1
+            )
+            sample_indices.append(len(input_ids) - 1)
+            sample_seqs.append(seq)
+
+        prefill_cu_seqlens_q = [0]
+        prefill_cu_seqlens_k = [0]
+        prefill_max_seqlen_q = 0
+        prefill_max_seqlen_k = 0
+        prefill_has_prefix = False
+        prefill_seq_lens = []
+        for item in prefill_requests:
+            seq = item.sequence
+            start = seq.num_cached_tokens
+            end = start + item.num_scheduled_tokens
+            input_ids.extend(seq[start:end])
+            positions.extend(range(start, end))
+            prefill_seq_lens.append(item.num_scheduled_tokens)
+            prefill_cu_seqlens_q.append(
+                prefill_cu_seqlens_q[-1] + item.num_scheduled_tokens
+            )
+            prefill_cu_seqlens_k.append(prefill_cu_seqlens_k[-1] + end)
+            prefill_max_seqlen_q = max(
+                prefill_max_seqlen_q, item.num_scheduled_tokens
+            )
+            prefill_max_seqlen_k = max(prefill_max_seqlen_k, end)
+            prefill_has_prefix = prefill_has_prefix or end > item.num_scheduled_tokens
+
+            start_block = start // self.block_size
+            end_block = (end + self.block_size - 1) // self.block_size
+            for block_idx in range(start_block, end_block):
+                slot_start = seq.block_table[block_idx] * self.block_size
+                if block_idx == start_block:
+                    slot_start += start % self.block_size
+                if block_idx != end_block - 1:
+                    slot_end = (
+                        seq.block_table[block_idx] * self.block_size
+                        + self.block_size
+                    )
+                else:
+                    slot_end = (
+                        seq.block_table[block_idx] * self.block_size
+                        + end
+                        - block_idx * self.block_size
+                    )
+                slot_mapping.extend(range(slot_start, slot_end))
+            if item.sample:
+                sample_indices.append(len(input_ids) - 1)
+                sample_seqs.append(seq)
+
+        input_ids_tensor = torch.tensor(
+            input_ids, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+        positions_tensor = torch.tensor(
+            positions, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+        slot_mapping_tensor = torch.tensor(
+            slot_mapping, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        sample_indices_tensor = torch.tensor(
+            sample_indices, dtype=torch.long, pin_memory=True
+        ).cuda(non_blocking=True)
+
+        decode_seqs = [item.sequence for item in decode_requests]
+        decode_context_lens_tensor = (
+            torch.tensor(
+                decode_context_lens,
+                dtype=torch.int32,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            if decode_seqs
+            else None
+        )
+        decode_block_tables = (
+            self.prepare_block_tables(decode_seqs) if decode_seqs else None
+        )
+
+        prefill_seqs = [item.sequence for item in prefill_requests]
+        prefill_cu_seqlens_q_tensor = (
+            torch.tensor(
+                prefill_cu_seqlens_q,
+                dtype=torch.int32,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            if prefill_seqs
+            else None
+        )
+        prefill_cu_seqlens_k_tensor = (
+            torch.tensor(
+                prefill_cu_seqlens_k,
+                dtype=torch.int32,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            if prefill_seqs
+            else None
+        )
+        prefill_block_tables = (
+            self.prepare_block_tables(prefill_seqs)
+            if prefill_seqs and prefill_has_prefix
+            else None
+        )
+        set_context(
+            False,
+            slot_mapping=slot_mapping_tensor,
+            is_mixed=True,
+            num_decode_requests=len(decode_requests),
+            decode_context_lens=decode_context_lens_tensor,
+            decode_block_tables=decode_block_tables,
+            prefill_cu_seqlens_q=prefill_cu_seqlens_q_tensor,
+            prefill_cu_seqlens_k=prefill_cu_seqlens_k_tensor,
+            prefill_max_seqlen_q=prefill_max_seqlen_q,
+            prefill_max_seqlen_k=prefill_max_seqlen_k,
+            prefill_block_tables=prefill_block_tables,
+            prefill_seq_lens=tuple(prefill_seq_lens),
+            sequence_query_lens=tuple(
+                item.num_scheduled_tokens for item in requests
+            ),
+            sample_indices=sample_indices_tensor,
+        )
+        return input_ids_tensor, positions_tensor, sample_seqs, sample_indices
+
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
@@ -324,13 +474,25 @@ class ModelRunner:
         positions: torch.Tensor,
         is_prefill: bool,
         layer_states=None,
+        compute_logits: bool = True,
     ):
         if layer_states is not None:
             hidden_states = self.model(input_ids, positions, layer_states=layer_states)
-            return self.model.compute_logits(hidden_states)
+            return (
+                self.model.compute_logits(hidden_states)
+                if compute_logits
+                else hidden_states
+            )
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            hidden_states = self.model(input_ids, positions)
+            return (
+                self.model.compute_logits(hidden_states)
+                if compute_logits
+                else hidden_states
+            )
         else:
+            if not compute_logits:
+                raise ValueError("decode always requires logits")
             bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
@@ -345,37 +507,222 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    def _prepare_hybrid_state_batch(
+        self,
+        seqs: list[Sequence],
+        *,
+        allow_reorder: bool,
+    ) -> tuple[list[Sequence], dict | None, bool]:
+        manager = self.hybrid_state_manager
+        if manager is None:
+            return seqs, None, False
+
+        requested_ids = [seq.seq_id for seq in seqs]
+        manager.allocate(requested_ids)
+        if not self.config.resident_deltanet_state:
+            with profile_range("qwen35_state_gather"):
+                layer_states = manager.gather(requested_ids)
+            self.execution_stats["state_gather_calls"] += 1
+            return seqs, layer_states, False
+
+        resident_ids = manager.resident_order(requested_ids)
+        if resident_ids is not None and (
+            allow_reorder or resident_ids == requested_ids
+        ):
+            seq_by_id = {seq.seq_id: seq for seq in seqs}
+            ordered_seqs = [seq_by_id[seq_id] for seq_id in resident_ids]
+            with profile_range("qwen35_state_resident_view"):
+                layer_states = manager.resident(resident_ids)
+            self.execution_stats["state_resident_view_calls"] += 1
+            return ordered_seqs, layer_states, True
+
+        with profile_range("qwen35_state_gather"):
+            layer_states = manager.gather(requested_ids)
+        self.execution_stats["state_gather_calls"] += 1
+        return seqs, layer_states, False
+
+    @staticmethod
+    def _restore_request_order(
+        values,
+        execution_seqs: list[Sequence],
+        requested_seqs: list[Sequence],
+    ):
+        if values is None or execution_seqs == requested_seqs:
+            return values
+        row_by_id = {
+            seq.seq_id: row for row, seq in enumerate(execution_seqs)
+        }
+        rows = [row_by_id[seq.seq_id] for seq in requested_seqs]
+        if isinstance(values, torch.Tensor):
+            return values[rows]
+        return [values[row] for row in rows]
+
+    def _finish_hybrid_state_batch(
+        self,
+        layer_states: dict | None,
+        is_resident: bool,
+    ) -> None:
+        if layer_states is None:
+            return
+        if is_resident:
+            self.hybrid_state_manager.finish_resident(layer_states)
+            self.execution_stats["state_commit_skipped_calls"] += 1
+            return
+        with profile_range("qwen35_state_commit"):
+            self.hybrid_state_manager.commit(layer_states)
+        self.execution_stats["state_commit_calls"] += 1
+
     def run(
         self,
         seqs: list[Sequence],
         is_prefill: bool,
         return_logits: bool = False,
+        skip_sampling: bool = False,
     ):
+        self.execution_stats["model_runner_calls"] += 1
+        self.execution_stats[
+            "prefill_model_runner_calls"
+            if is_prefill
+            else "decode_model_runner_calls"
+        ] += 1
+        if skip_sampling and (not is_prefill or return_logits):
+            raise ValueError(
+                "skip_sampling is only valid for intermediate prefill chunks"
+            )
+        requested_seqs = seqs
+        seqs, layer_states, resident_states = (
+            self._prepare_hybrid_state_batch(
+                requested_seqs,
+                allow_reorder=True,
+            )
+        )
         with profile_range("qwen35_metadata_prepare"):
             input_ids, positions = (
                 self.prepare_prefill(seqs)
                 if is_prefill
                 else self.prepare_decode(seqs)
             )
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        layer_states = None
-        if self.hybrid_state_manager is not None:
-            seq_ids = [seq.seq_id for seq in seqs]
-            self.hybrid_state_manager.allocate(seq_ids)
-            with profile_range("qwen35_state_gather"):
-                layer_states = self.hybrid_state_manager.gather(seq_ids)
+        temperatures = (
+            self.prepare_sample(seqs)
+            if self.rank == 0 and not skip_sampling
+            else None
+        )
         phase = "prefill" if is_prefill else "decode"
         with profile_range(f"qwen35_{phase}_model"):
-            logits = self.run_model(input_ids, positions, is_prefill, layer_states)
-        if layer_states is not None:
-            with profile_range("qwen35_state_commit"):
-                self.hybrid_state_manager.commit(layer_states)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        logits_cpu = logits.float().cpu() if return_logits and self.rank == 0 else None
+            model_output = self.run_model(
+                input_ids,
+                positions,
+                is_prefill,
+                layer_states,
+                compute_logits=not skip_sampling,
+            )
+        self._finish_hybrid_state_batch(layer_states, resident_states)
+        if skip_sampling:
+            token_ids = [0] * len(seqs) if self.rank == 0 else None
+            logits_cpu = None
+        else:
+            logits = model_output
+            token_ids = (
+                self.sampler(logits, temperatures).tolist()
+                if self.rank == 0
+                else None
+            )
+            logits_cpu = (
+                logits.float().cpu()
+                if return_logits and self.rank == 0
+                else None
+            )
+        token_ids = self._restore_request_order(
+            token_ids,
+            seqs,
+            requested_seqs,
+        )
+        logits_cpu = self._restore_request_order(
+            logits_cpu,
+            seqs,
+            requested_seqs,
+        )
         reset_context()
         if return_logits:
             return token_ids, logits_cpu
         return token_ids
+
+    def run_mixed(
+        self,
+        requests: list[ScheduledRequest],
+        return_logits: bool = False,
+    ):
+        self.execution_stats["model_runner_calls"] += 1
+        self.execution_stats["unified_model_runner_calls"] += 1
+        if not requests:
+            raise ValueError("run_mixed requires at least one scheduled request")
+        if not self.is_hybrid:
+            raise RuntimeError(
+                "Unified mixed execution currently supports hybrid models only"
+            )
+        with profile_range("qwen35_metadata_prepare_mixed"):
+            input_ids, positions, sample_seqs, _ = self.prepare_mixed(requests)
+
+        temperatures = (
+            self.prepare_sample(sample_seqs)
+            if self.rank == 0 and sample_seqs
+            else None
+        )
+        seqs = [item.sequence for item in requests]
+        _, layer_states, resident_states = self._prepare_hybrid_state_batch(
+            seqs,
+            allow_reorder=False,
+        )
+
+        with profile_range("qwen35_unified_model"):
+            model_output = self.run_model(
+                input_ids,
+                positions,
+                True,
+                layer_states,
+                compute_logits=bool(sample_seqs),
+            )
+        self._finish_hybrid_state_batch(layer_states, resident_states)
+
+        sampled_tokens = {}
+        logits_cpu = None
+        if sample_seqs:
+            token_ids = (
+                self.sampler(model_output, temperatures).tolist()
+                if self.rank == 0
+                else None
+            )
+            if self.rank == 0:
+                sampled_tokens = {
+                    seq.seq_id: token_id
+                    for seq, token_id in zip(sample_seqs, token_ids)
+                }
+                if return_logits:
+                    logits_cpu = model_output.float().cpu()
+        reset_context()
+        if return_logits:
+            return sampled_tokens, logits_cpu
+        return sampled_tokens
+
+    def reset_execution_stats(self) -> None:
+        self.execution_stats = {
+            "model_runner_calls": 0,
+            "prefill_model_runner_calls": 0,
+            "decode_model_runner_calls": 0,
+            "unified_model_runner_calls": 0,
+            "state_resident_view_calls": 0,
+            "state_gather_calls": 0,
+            "state_commit_calls": 0,
+            "state_commit_skipped_calls": 0,
+        }
+        if getattr(self, "hybrid_state_manager", None) is not None:
+            self.hybrid_state_manager.max_allocated_count = (
+                self.hybrid_state_manager.allocated_count
+            )
+            self.hybrid_state_manager.reset_runtime_stats()
+
+    def get_execution_stats(self) -> dict[str, int]:
+        return dict(self.execution_stats)
 
     def release_states(self, seq_ids: list[int]):
         if self.hybrid_state_manager is not None:
@@ -419,12 +766,22 @@ class ModelRunner:
             "capacity": self.hybrid_state_manager.capacity,
             "allocated": self.hybrid_state_manager.allocated_count,
             "free": self.hybrid_state_manager.free_count,
+            "max_allocated": self.hybrid_state_manager.max_allocated_count,
+            "utilization": (
+                self.hybrid_state_manager.allocated_count
+                / self.hybrid_state_manager.capacity
+            ),
+            "max_utilization": (
+                self.hybrid_state_manager.max_allocated_count
+                / self.hybrid_state_manager.capacity
+            ),
             "delta_bytes_per_sequence": delta_bytes_per_sequence,
             "delta_pool_bytes": self.hybrid_state_manager.capacity
             * delta_bytes_per_sequence,
             "kv_bytes_per_block": kv_bytes_per_block,
             "num_kv_blocks": self.config.num_kvcache_blocks,
             "kv_cache_bytes": self.config.num_kvcache_blocks * kv_bytes_per_block,
+            "state_execution": self.hybrid_state_manager.get_runtime_stats(),
         }
 
     @torch.inference_mode()

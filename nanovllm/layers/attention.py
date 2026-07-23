@@ -61,6 +61,40 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        if context.is_mixed:
+            num_decode = context.num_decode_requests
+            output = torch.empty_like(q)
+            if num_decode:
+                decode_output = flash_attn_with_kvcache(
+                    q[:num_decode].unsqueeze(1),
+                    k_cache,
+                    v_cache,
+                    cache_seqlens=context.decode_context_lens,
+                    block_table=context.decode_block_tables,
+                    softmax_scale=self.scale,
+                    causal=True,
+                )
+                output[:num_decode] = decode_output.squeeze(1)
+            if num_decode < q.shape[0]:
+                prefill_q = q[num_decode:]
+                prefill_k = k[num_decode:]
+                prefill_v = v[num_decode:]
+                if context.prefill_block_tables is not None:
+                    prefill_k, prefill_v = k_cache, v_cache
+                prefill_output = flash_attn_varlen_func(
+                    prefill_q,
+                    prefill_k,
+                    prefill_v,
+                    max_seqlen_q=context.prefill_max_seqlen_q,
+                    cu_seqlens_q=context.prefill_cu_seqlens_q,
+                    max_seqlen_k=context.prefill_max_seqlen_k,
+                    cu_seqlens_k=context.prefill_cu_seqlens_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    block_table=context.prefill_block_tables,
+                )
+                output[num_decode:] = prefill_output
+            return output
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache

@@ -676,6 +676,79 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         layer_state: DeltaNetState,
     ) -> torch.Tensor:
         context = get_context()
+        if context.is_mixed:
+            if context.sequence_query_lens is None:
+                raise RuntimeError("Mixed DeltaNet execution is missing query lengths")
+            seq_lens = context.sequence_query_lens
+            if sum(seq_lens) != hidden_states.shape[0]:
+                raise ValueError(
+                    "Mixed DeltaNet token count does not match query lengths: "
+                    f"tokens={hidden_states.shape[0]}, query_lens={seq_lens}"
+                )
+            if layer_state.conv_state.shape[0] != len(seq_lens):
+                raise ValueError(
+                    "Mixed DeltaNet state batch does not match request count: "
+                    f"state={layer_state.conv_state.shape[0]}, requests={len(seq_lens)}"
+                )
+
+            num_decode = context.num_decode_requests
+            outputs = []
+            if num_decode:
+                decode_state = DeltaNetState(
+                    layer_idx=self.layer_idx,
+                    conv_state=layer_state.conv_state[:num_decode],
+                    recurrent_state=layer_state.recurrent_state[:num_decode],
+                )
+                decode_hidden = hidden_states[:num_decode].unsqueeze(1)
+                outputs.append(
+                    self._forward_stateful_chunk(
+                        decode_hidden,
+                        decode_state,
+                    ).squeeze(1)
+                )
+
+            prefill_lens = seq_lens[num_decode:]
+            if prefill_lens:
+                prefill_hidden = hidden_states[num_decode:]
+                prefill_state = DeltaNetState(
+                    layer_idx=self.layer_idx,
+                    conv_state=layer_state.conv_state[num_decode:],
+                    recurrent_state=layer_state.recurrent_state[num_decode:],
+                )
+                equal_length = len(set(prefill_lens)) == 1
+                if self.deltanet_backend == "chunked" and equal_length:
+                    seq_len = prefill_lens[0]
+                    batched = prefill_hidden.reshape(
+                        len(prefill_lens),
+                        seq_len,
+                        prefill_hidden.shape[-1],
+                    )
+                    outputs.append(
+                        self._forward_stateful_chunk(batched, prefill_state).reshape(
+                            -1, prefill_hidden.shape[-1]
+                        )
+                    )
+                else:
+                    chunks = prefill_hidden.split(prefill_lens, dim=0)
+                    per_request_outputs = []
+                    for batch_idx, chunk in enumerate(chunks):
+                        request_state = DeltaNetState(
+                            layer_idx=self.layer_idx,
+                            conv_state=prefill_state.conv_state[
+                                batch_idx : batch_idx + 1
+                            ],
+                            recurrent_state=prefill_state.recurrent_state[
+                                batch_idx : batch_idx + 1
+                            ],
+                        )
+                        per_request_outputs.append(
+                            self._forward_stateful_chunk(
+                                chunk.unsqueeze(0),
+                                request_state,
+                            ).squeeze(0)
+                        )
+                    outputs.append(torch.cat(per_request_outputs, dim=0))
+            return torch.cat(outputs, dim=0)
         if context.is_prefill:
             if context.prefill_seq_lens is None:
                 raise RuntimeError("Packed prefill is missing sequence lengths")
@@ -979,7 +1052,11 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_context()
-        if context.is_prefill and hidden_states.ndim == 2:
+        if context.is_mixed and hidden_states.ndim == 2:
+            if context.sample_indices is None:
+                raise RuntimeError("Mixed execution is missing sample indices")
+            hidden_states = hidden_states.index_select(0, context.sample_indices)
+        elif context.is_prefill and hidden_states.ndim == 2:
             hidden_states = hidden_states[context.cu_seqlens_q[1:] - 1].contiguous()
         return self.lm_head(hidden_states)
 

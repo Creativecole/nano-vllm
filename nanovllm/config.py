@@ -53,8 +53,15 @@ class Config:
     enforce_eager: bool = False
     hybrid_state_capacity: int = 0
     hybrid_state_memory_fraction: float = 0.1
+    resident_deltanet_state: bool = True
     deltanet_backend: str = "sequential"
     deltanet_chunk_size: int = 64
+    scheduler_policy: str = "prefill_first"
+    max_prefill_chunk_tokens: int = 256
+    max_partial_prefills: int = 1
+    max_long_partial_prefills: int = 1
+    long_prefill_token_threshold: int = 0
+    decode_reserve_blocks_per_seq: int = 1
     enable_prefix_cache: bool = True
     hf_config: object | None = None
     hf_text_config: object | None = None
@@ -76,6 +83,25 @@ class Config:
             )
         if self.deltanet_chunk_size <= 0:
             raise ValueError("deltanet_chunk_size must be positive")
+        if self.scheduler_policy not in ("prefill_first", "interleave", "unified"):
+            raise ValueError(
+                "scheduler_policy must be 'prefill_first', 'interleave', or "
+                "'unified', "
+                f"got {self.scheduler_policy!r}"
+            )
+        if self.max_prefill_chunk_tokens <= 0:
+            raise ValueError("max_prefill_chunk_tokens must be positive")
+        if self.max_partial_prefills <= 0:
+            raise ValueError("max_partial_prefills must be positive")
+        if not 0 <= self.max_long_partial_prefills <= self.max_partial_prefills:
+            raise ValueError(
+                "max_long_partial_prefills must be between 0 and "
+                "max_partial_prefills"
+            )
+        if self.long_prefill_token_threshold < 0:
+            raise ValueError("long_prefill_token_threshold cannot be negative")
+        if self.decode_reserve_blocks_per_seq < 0:
+            raise ValueError("decode_reserve_blocks_per_seq cannot be negative")
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.hf_text_config = get_hf_text_config(self.hf_config)
         dtype_value = self.dtype

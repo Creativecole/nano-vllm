@@ -32,6 +32,15 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.decode_reservations: dict[int, int] = {}
+
+    @property
+    def num_reserved_blocks(self) -> int:
+        return sum(self.decode_reservations.values())
+
+    @property
+    def num_unreserved_free_blocks(self) -> int:
+        return len(self.free_block_ids) - self.num_reserved_blocks
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -56,9 +65,10 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> int:
+    def can_allocate(self, seq: Sequence, reserve_blocks: int = 0) -> int:
         if not self.enable_prefix_cache:
-            return 0 if len(self.free_block_ids) >= seq.num_blocks else -1
+            required = seq.num_blocks + reserve_blocks
+            return 0 if self.num_unreserved_free_blocks >= required else -1
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
@@ -71,11 +81,16 @@ class BlockManager:
             num_cached_blocks += 1
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
-        if len(self.free_block_ids) < num_new_blocks:
+        if self.num_unreserved_free_blocks < num_new_blocks + reserve_blocks:
             return -1
         return num_cached_blocks
 
-    def allocate(self, seq: Sequence, num_cached_blocks: int):
+    def allocate(
+        self,
+        seq: Sequence,
+        num_cached_blocks: int,
+        reserve_blocks: int = 0,
+    ):
         assert not seq.block_table
         h = -1
         for i in range(num_cached_blocks):
@@ -93,6 +108,8 @@ class BlockManager:
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
+        if reserve_blocks:
+            self.decode_reservations[seq.seq_id] = reserve_blocks
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -102,13 +119,23 @@ class BlockManager:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        self.decode_reservations.pop(seq.seq_id, None)
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        if len(seq) % self.block_size != 1:
+            return True
+        if self.decode_reservations.get(seq.seq_id, 0) > 0:
+            return bool(self.free_block_ids)
+        return self.num_unreserved_free_blocks > 0
 
     def may_append(self, seq: Sequence):
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
+            reserved = self.decode_reservations.get(seq.seq_id, 0)
+            if reserved == 1:
+                del self.decode_reservations[seq.seq_id]
+            elif reserved > 1:
+                self.decode_reservations[seq.seq_id] = reserved - 1
 
     def hash_blocks(self, seq: Sequence):
         if not self.enable_prefix_cache:

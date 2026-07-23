@@ -81,11 +81,49 @@ def test_config_accepts_chunked_deltanet_backend(monkeypatch, tmp_path):
     assert config.deltanet_chunk_size == 32
 
 
+def test_config_can_disable_resident_deltanet_state(monkeypatch, tmp_path):
+    text = SimpleNamespace(dtype=torch.bfloat16, max_position_embeddings=128)
+    monkeypatch.setattr(
+        "nanovllm.config.AutoConfig.from_pretrained",
+        lambda _model: text,
+    )
+    config = Config(
+        model=str(tmp_path),
+        resident_deltanet_state=False,
+    )
+    assert not config.resident_deltanet_state
+
+
+def test_config_accepts_unified_hybrid_scheduler(monkeypatch, tmp_path):
+    text = SimpleNamespace(dtype=torch.bfloat16, max_position_embeddings=128)
+    monkeypatch.setattr(
+        "nanovllm.config.AutoConfig.from_pretrained",
+        lambda _model: text,
+    )
+    config = Config(
+        model=str(tmp_path),
+        scheduler_policy="unified",
+        max_prefill_chunk_tokens=64,
+        max_partial_prefills=2,
+        max_long_partial_prefills=1,
+        long_prefill_token_threshold=32,
+        decode_reserve_blocks_per_seq=2,
+    )
+    assert config.scheduler_policy == "unified"
+    assert config.max_partial_prefills == 2
+    assert config.max_long_partial_prefills == 1
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
         {"deltanet_backend": "fused"},
         {"deltanet_chunk_size": 0},
+        {"scheduler_policy": "unknown"},
+        {"max_partial_prefills": 0},
+        {"max_partial_prefills": 1, "max_long_partial_prefills": 2},
+        {"long_prefill_token_threshold": -1},
+        {"decode_reserve_blocks_per_seq": -1},
     ],
 )
 def test_config_rejects_invalid_deltanet_settings(monkeypatch, tmp_path, kwargs):

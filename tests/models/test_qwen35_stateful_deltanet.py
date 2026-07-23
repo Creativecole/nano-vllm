@@ -235,6 +235,84 @@ def test_variable_length_packed_prefill_keeps_correct_fallback(hf_tiny_config):
     )
 
 
+@pytest.mark.parametrize("prefill_lens", [(65,), (31, 65)])
+def test_mixed_decode_and_prefill_matches_separate_execution(
+    hf_tiny_config,
+    prefill_lens,
+):
+    torch.manual_seed(73)
+    num_decode = 2
+    hf_tiny_config.nanovllm_deltanet_backend = "chunked"
+    hf_tiny_config.nanovllm_deltanet_chunk_size = 64
+    layer = Qwen3_5GatedDeltaNet(hf_tiny_config, layer_idx=0).eval()
+    decode_hidden = torch.randn(num_decode, hf_tiny_config.hidden_size)
+    prefill_rows = [
+        torch.randn(length, hf_tiny_config.hidden_size)
+        for length in prefill_lens
+    ]
+    packed = torch.cat([decode_hidden, *prefill_rows], dim=0)
+    batch_size = num_decode + len(prefill_rows)
+    state = make_zero_state(layer, batch_size, packed.dtype)
+    reference_state = make_zero_state(layer, batch_size, packed.dtype)
+
+    try:
+        set_context(
+            False,
+            is_mixed=True,
+            num_decode_requests=num_decode,
+            sequence_query_lens=(1,) * num_decode + prefill_lens,
+        )
+        with torch.no_grad():
+            actual = layer._forward_packed(packed, state)
+    finally:
+        reset_context()
+
+    with torch.no_grad():
+        decode_state = DeltaNetState(
+            layer_idx=0,
+            conv_state=reference_state.conv_state[:num_decode],
+            recurrent_state=reference_state.recurrent_state[:num_decode],
+        )
+        expected_rows = [
+            layer._forward_stateful_chunk(
+                decode_hidden.unsqueeze(1),
+                decode_state,
+            ).squeeze(1)
+        ]
+        for offset, prefill_hidden in enumerate(prefill_rows):
+            state_index = num_decode + offset
+            request_state = DeltaNetState(
+                layer_idx=0,
+                conv_state=reference_state.conv_state[
+                    state_index : state_index + 1
+                ],
+                recurrent_state=reference_state.recurrent_state[
+                    state_index : state_index + 1
+                ],
+            )
+            expected_rows.append(
+                layer._forward_stateful_chunk(
+                    prefill_hidden.unsqueeze(0),
+                    request_state,
+                ).squeeze(0)
+            )
+        expected = torch.cat(expected_rows, dim=0)
+
+    torch.testing.assert_close(actual, expected, rtol=3e-4, atol=3e-5)
+    torch.testing.assert_close(
+        state.conv_state,
+        reference_state.conv_state,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        state.recurrent_state,
+        reference_state.recurrent_state,
+        rtol=3e-4,
+        atol=3e-5,
+    )
+
+
 def test_batched_prefill_then_decode_matches_sequential_execution(hf_tiny_config):
     torch.manual_seed(73)
     batch_size, prompt_len, decode_steps = 4, 65, 3
