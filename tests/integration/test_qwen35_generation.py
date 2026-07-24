@@ -187,3 +187,74 @@ def test_qwen35_decode_fast_path_matches_normal_decode():
     assert baseline_stats["decode_fast_path_hits"] == 0
     assert fast_stats["decode_fast_path_hits"] > 0
     assert fast_stats["decode_fast_path_builds"] > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_qwen35_decode_fast_path_matches_dynamic_batch_lifecycle():
+    model_path = os.environ.get("NANOVLLM_QWEN35_MODEL")
+    if not model_path:
+        pytest.skip("set NANOVLLM_QWEN35_MODEL to run the Qwen3.5 integration test")
+
+    from nanovllm import LLM, SamplingParams
+
+    requests = [
+        ([1, 2, 3, 4, 5, 6, 7], 6),
+        ([8, 9, 10, 11], 2),
+        ([12, 13, 14, 15, 16], 5),
+    ]
+
+    def generate(decode_fast_path):
+        llm = LLM(
+            model_path,
+            enforce_eager=True,
+            max_num_seqs=3,
+            hybrid_state_capacity=3,
+            deltanet_backend="chunked",
+            resident_deltanet_state=True,
+            decode_fast_path=decode_fast_path,
+        )
+        request_ids = []
+        completed = {}
+        try:
+            for prompt, max_tokens in requests[:2]:
+                request_ids.append(
+                    llm.add_request(
+                        prompt,
+                        SamplingParams(
+                            temperature=0.0,
+                            max_tokens=max_tokens,
+                            ignore_eos=True,
+                        ),
+                    )
+                )
+
+            step_outputs, _ = llm.step()
+            completed.update(step_outputs)
+
+            prompt, max_tokens = requests[2]
+            request_ids.append(
+                llm.add_request(
+                    prompt,
+                    SamplingParams(
+                        temperature=0.0,
+                        max_tokens=max_tokens,
+                        ignore_eos=True,
+                    ),
+                )
+            )
+            while not llm.is_finished():
+                step_outputs, _ = llm.step()
+                completed.update(step_outputs)
+
+            stats = llm.model_runner.call("get_execution_stats")
+            return [completed[seq_id] for seq_id in request_ids], stats
+        finally:
+            llm.exit()
+
+    baseline_tokens, baseline_stats = generate(False)
+    fast_tokens, fast_stats = generate(True)
+
+    assert fast_tokens == baseline_tokens
+    assert baseline_stats["decode_fast_path_hits"] == 0
+    assert fast_stats["decode_fast_path_hits"] > 0
+    assert fast_stats["decode_fast_path_invalidations"] > 0
