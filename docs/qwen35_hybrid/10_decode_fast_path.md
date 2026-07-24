@@ -145,9 +145,58 @@ The profiler exposes `qwen35_metadata_prepare` and
 unchanged; the intended impact surface is CPU preparation, metadata allocation, H2D
 copies, and end-to-end ITL.
 
+## RTX 5090 Results
+
+The fixed-batch E2E sweep found no repeatable throughput improvement: measured
+fast-path deltas stayed between approximately `-0.6%` and `+0.8%` across the valid
+Qwen3.5-9B BF16 cases. Peak memory was unchanged. Both modes reached the same OOM
+boundary for the largest attempted case, so the fast path did not introduce a
+separate memory-growth failure.
+
+PyTorch Profiler confirms that the intended host preparation work was removed:
+
+| Metric | Normal decode | Fast decode |
+|---|---:|---:|
+| Metadata + resident-state preparation | 0.778 ms/step | 0.133 ms/step |
+| Resident state view calls | 128 | 2 |
+| `aten::copy_` calls | 88,057 | 87,301 |
+| `aten::empty` calls | 14,424 | 13,668 |
+| `aten::empty_strided` calls | 73,569 | 72,813 |
+| CUDA runtime self CPU time | 1,680.0 ms | 1,668.3 ms |
+| `aten::mm` self CUDA time | 1,669.63 ms | 1,669.68 ms |
+
+The fast path saved about `0.645 ms` of preparation per decode step, but its three
+in-place device metadata updates added exactly 378 launches over 126 reused steps.
+Model-side GEMM and attention work remained unchanged. This explains why the local
+preparation improvement did not become a measurable fixed-batch E2E speedup.
+
+The dynamic mixed-workload benchmark reached a `91.4%` fast-path hit rate at
+2 requests/s and approximately `93.1%` at 4 and 8 requests/s. The 2 requests/s run
+completed the same 97 requests in both modes:
+
+| Metric | Normal decode | Fast decode | Delta |
+|---|---:|---:|---:|
+| Output throughput | 120.29 tok/s | 120.86 tok/s | +0.48% |
+| TTFT p95 | 29.028 s | 28.662 s | -1.26% |
+| ITL p95 | 44.91 ms | 43.99 ms | -2.05% |
+
+These are single-seed, noise-level differences and are not reported as performance
+gains. The 4 and 8 requests/s runs were saturated and admitted different request
+sets, so their aggregate latency and throughput are not valid direct A/B speedup
+comparisons.
+
+Correctness was validated separately from wall-clock serving arrivals. Fixed-batch
+tests compare logits and tokens exactly. A deterministic dynamic-lifecycle test
+injects requests at the same engine steps in both modes and covers request arrival,
+completion, state release, and batch compaction; it also produces identical greedy
+tokens. Wall-clock online runs can form different batches as execution timing changes,
+so they are performance workloads rather than strict token-equivalence tests.
+
 ## Current Boundary
 
 The fast path is eager-only for Qwen3.5 hybrid execution. It deliberately does not
 cover dynamic batch compaction, a step containing new prefill work, CUDA Graph,
 multi-GPU tensor parallelism, or prefill/decode disaggregation. Those cases use the
-existing normal path.
+existing normal path. It remains disabled by default because the profiler proves a
+local metadata-preparation reduction but the fixed-batch and online A/B results do
+not establish a meaningful E2E improvement.
