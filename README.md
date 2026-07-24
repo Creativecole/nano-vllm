@@ -188,6 +188,10 @@ owns the physical paged-KV tensors and request-scoped DeltaNet state slots.
 `HybridAttentionMetadataBuilder` converts one execution step into typed full-attention
 and DeltaNet metadata. Decoder layers bind their backend once during construction, so
 the forward path no longer contains a model-specific Full Attention/DeltaNet branch.
+When explicitly enabled, `HybridDecodeContext` reuses typed metadata, paged-KV layout
+references, and resident DeltaNet views for an unchanged decode batch. Batch or
+cache-layout changes fall back to normal preparation. It remains experimental because
+the current RTX 5090 A/B shows no meaningful E2E improvement.
 
 ### Hybrid Cache
 
@@ -237,6 +241,8 @@ Decode
   one token per active request
     -> Full Attention: paged KV read/write
     -> DeltaNet: sequential recurrent-state update
+    -> stable batch: cached metadata/state views
+    -> dynamic batch or KV block growth: normal preparation fallback
 ```
 
 The `sequential` DeltaNet backend remains available as the reference implementation.
@@ -289,6 +295,7 @@ llm.exit()
 nanovllm/
   models/qwen3_5.py          # Full Attention + Gated DeltaNet model
   engine/layer_state.py      # Paged KV and request-scoped DeltaNet state
+  engine/decode_context.py   # steady-state decode metadata fast path
   engine/model_runner.py     # hybrid cache allocation and execution
   models/registry.py         # model dispatch
 
@@ -300,6 +307,7 @@ benchmarks/qwen35_hybrid/
   bench_serving.py
   bench_serving_sweep.py
   bench_resident_state_compare.py
+  bench_decode_fast_path.py
   profile_layers.py
   profile_serving.py
   run_nsight.py

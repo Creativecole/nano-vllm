@@ -54,6 +54,7 @@ class Config:
     hybrid_state_capacity: int = 0
     hybrid_state_memory_fraction: float = 0.1
     resident_deltanet_state: bool = True
+    decode_fast_path: bool = False
     deltanet_backend: str = "sequential"
     deltanet_chunk_size: int = 64
     scheduler_policy: str = "prefill_first"

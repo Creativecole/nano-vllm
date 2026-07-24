@@ -59,6 +59,11 @@ def parse_args():
         help="Use materialized DeltaNet state gather/commit for A/B validation.",
     )
     parser.add_argument(
+        "--enable-decode-fast-path",
+        action="store_true",
+        help="Enable the experimental steady-state decode metadata fast path.",
+    )
+    parser.add_argument(
         "--scheduler-policy",
         choices=("prefill_first", "interleave", "unified"),
         default="prefill_first",
@@ -123,8 +128,10 @@ def default_json_path(args) -> Path:
         if args.disable_resident_deltanet_state
         else "resident"
     )
+    decode_path = "decodefast" if args.enable_decode_fast_path else "decodenormal"
     return DEFAULT_RESULTS_DIR / (
-        f"online_{args.backend}_{policy}_{state_path}_{args.workload}_r{rate}.json"
+        f"online_{args.backend}_{policy}_{state_path}_{decode_path}_"
+        f"{args.workload}_r{rate}.json"
     )
 
 
@@ -142,8 +149,9 @@ def default_summary_md_path(args) -> Path:
         if args.disable_resident_deltanet_state
         else "resident"
     )
+    decode_path = "decodefast" if args.enable_decode_fast_path else "decodenormal"
     return REPO_ROOT / "docs/qwen35_hybrid" / (
-        f"online_{args.backend}_{policy}_{state_path}_{args.workload}_"
+        f"online_{args.backend}_{policy}_{state_path}_{decode_path}_{args.workload}_"
         f"r{rate}_summary.md"
     )
 
@@ -182,6 +190,12 @@ def render_markdown(payload: dict[str, object]) -> str:
     scheduler_stats = cache_stats.get("scheduler") or {}
     execution_stats = cache_stats.get("execution") or {}
     state_execution_stats = cache_stats.get("state_execution") or {}
+    fast_hits = execution_stats.get("decode_fast_path_hits") or 0
+    normal_decode_steps = execution_stats.get("decode_fast_path_normal_steps") or 0
+    fast_eligible_steps = fast_hits + normal_decode_steps
+    fast_hit_rate = (
+        fast_hits / fast_eligible_steps if fast_eligible_steps else None
+    )
     overview = markdown_table(
         ["Metric", "Value"],
         [
@@ -190,6 +204,7 @@ def render_markdown(payload: dict[str, object]) -> str:
                 "resident DeltaNet state",
                 config["resident_deltanet_state"],
             ],
+            ["decode fast path", config["decode_fast_path"]],
             ["workload", config["workload"]],
             ["scheduler policy", config["scheduler_policy"]],
             [
@@ -299,6 +314,17 @@ def render_markdown(payload: dict[str, object]) -> str:
             [
                 "Unified ModelRunner calls",
                 execution_stats.get("unified_model_runner_calls"),
+            ],
+            ["Decode fast-path hits", fast_hits],
+            ["Decode normal-path steps", normal_decode_steps],
+            ["Decode fast-path hit rate", fast_hit_rate],
+            [
+                "Decode fast-path context builds",
+                execution_stats.get("decode_fast_path_builds"),
+            ],
+            [
+                "Decode fast-path invalidations",
+                execution_stats.get("decode_fast_path_invalidations"),
             ],
             ["State gather calls", execution_stats.get("state_gather_calls")],
             ["State commit calls", execution_stats.get("state_commit_calls")],
@@ -419,6 +445,7 @@ def main():
         max_num_seqs=args.max_num_seqs,
         hybrid_state_capacity=args.max_inflight_requests,
         resident_deltanet_state=not args.disable_resident_deltanet_state,
+        decode_fast_path=args.enable_decode_fast_path,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_model_len=max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
@@ -544,6 +571,7 @@ def main():
             "resident_deltanet_state": (
                 not args.disable_resident_deltanet_state
             ),
+            "decode_fast_path": args.enable_decode_fast_path,
             "scheduler_policy": args.scheduler_policy,
             "max_prefill_chunk_tokens": args.max_prefill_chunk_tokens,
             "max_partial_prefills": args.max_partial_prefills,

@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.attention import HybridAttentionMetadataBuilder
 from nanovllm.config import Config
 from nanovllm.engine.cache_coordinator import HybridCacheCoordinator
+from nanovllm.engine.decode_context import HybridDecodeContext
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import ScheduledRequest
 from nanovllm.engine.layer_state import (
@@ -31,6 +32,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.decode_context = None
         self.reset_execution_stats()
 
         model_class = get_model_class(config.hf_config, hf_config)
@@ -585,6 +587,106 @@ class ModelRunner:
             return
         self.execution_stats["state_commit_calls"] += 1
 
+    def _invalidate_decode_context(self, reason: str) -> None:
+        context = self.decode_context
+        if context is None:
+            return
+        context.invalidate(reason)
+        self.decode_context = None
+        self.execution_stats["decode_fast_path_invalidations"] += 1
+        key = f"decode_fast_path_invalidation_{reason}"
+        self.execution_stats[key] = self.execution_stats.get(key, 0) + 1
+
+    def _try_decode_fast_path(
+        self,
+        requested_seqs: list[Sequence],
+        *,
+        mode: str,
+    ):
+        if (
+            not self.is_hybrid
+            or not self.config.decode_fast_path
+            or self.hybrid_cache_coordinator is None
+        ):
+            return None
+        context = self.decode_context
+        if context is None:
+            self.execution_stats["decode_fast_path_normal_steps"] += 1
+            return None
+        failure = context.reuse_failure(
+            requested_seqs,
+            mode=mode,
+            state_layout_version=(
+                self.hybrid_cache_coordinator.state_layout_version
+            ),
+        )
+        if failure is not None:
+            self.execution_stats["decode_fast_path_normal_steps"] += 1
+            self._invalidate_decode_context(failure)
+            return None
+
+        execution_seqs = context.execution_sequences(requested_seqs)
+        with profile_range("qwen35_decode_prepare_fast"):
+            input_ids, positions = context.advance(execution_seqs)
+            context.activate_runtime_context()
+        self.execution_stats["decode_fast_path_hits"] += 1
+        self.execution_stats["decode_fast_path_state_view_reuses"] += 1
+        return (
+            execution_seqs,
+            context.layer_states,
+            input_ids,
+            positions,
+            context.attention_metadata,
+            context.temperatures,
+        )
+
+    def _create_decode_context(
+        self,
+        *,
+        mode: str,
+        requested_seqs: list[Sequence],
+        execution_seqs: list[Sequence],
+        layer_states: dict | None,
+        resident_states: bool,
+        attention_metadata,
+        temperatures: torch.Tensor | None,
+    ) -> None:
+        if (
+            not self.is_hybrid
+            or not self.config.decode_fast_path
+            or not resident_states
+            or layer_states is None
+            or temperatures is None
+            or self.hybrid_cache_coordinator is None
+        ):
+            self._invalidate_decode_context("ineligible_state_batch")
+            return
+        self.decode_context = HybridDecodeContext.create(
+            mode=mode,
+            requested_seqs=requested_seqs,
+            execution_seqs=execution_seqs,
+            state_layout_version=(
+                self.hybrid_cache_coordinator.state_layout_version
+            ),
+            layer_states=layer_states,
+            attention_metadata=attention_metadata,
+            temperatures=temperatures,
+        )
+        self.execution_stats["decode_fast_path_builds"] += 1
+
+    def _record_decode_sample(
+        self,
+        execution_seqs: list[Sequence],
+        sampled_tokens: torch.Tensor,
+    ) -> None:
+        context = self.decode_context
+        if context is None:
+            return
+        if tuple(seq.seq_id for seq in execution_seqs) != context.execution_ids:
+            self._invalidate_decode_context("sample_order_changed")
+            return
+        context.record_sampled_tokens(sampled_tokens)
+
     def run(
         self,
         seqs: list[Sequence],
@@ -603,32 +705,64 @@ class ModelRunner:
                 "skip_sampling is only valid for intermediate prefill chunks"
             )
         requested_seqs = seqs
-        seqs, layer_states, resident_states = (
-            self._prepare_hybrid_state_batch(
+        fast_path = None
+        if is_prefill:
+            self._invalidate_decode_context("prefill")
+        else:
+            fast_path = self._try_decode_fast_path(
                 requested_seqs,
-                allow_reorder=True,
+                mode="decode",
             )
-        )
-        with profile_range("qwen35_metadata_prepare"):
-            input_ids, positions = (
-                self.prepare_prefill(seqs)
-                if is_prefill
-                else self.prepare_decode(seqs)
+
+        if fast_path is not None:
+            (
+                seqs,
+                layer_states,
+                input_ids,
+                positions,
+                attention_metadata,
+                temperatures,
+            ) = fast_path
+            resident_states = True
+            used_fast_path = True
+        else:
+            seqs, layer_states, resident_states = (
+                self._prepare_hybrid_state_batch(
+                    requested_seqs,
+                    allow_reorder=True,
+                )
             )
-            attention_metadata = self._build_hybrid_attention_metadata(
-                request_ids=[seq.seq_id for seq in seqs],
-                query_lens=[
-                    seq.num_scheduled_tokens if is_prefill else 1
-                    for seq in seqs
-                ],
-                is_prefilling=[is_prefill] * len(seqs),
-                positions=positions,
+            with profile_range("qwen35_metadata_prepare"):
+                input_ids, positions = (
+                    self.prepare_prefill(seqs)
+                    if is_prefill
+                    else self.prepare_decode(seqs)
+                )
+                attention_metadata = self._build_hybrid_attention_metadata(
+                    request_ids=[seq.seq_id for seq in seqs],
+                    query_lens=[
+                        seq.num_scheduled_tokens if is_prefill else 1
+                        for seq in seqs
+                    ],
+                    is_prefilling=[is_prefill] * len(seqs),
+                    positions=positions,
+                )
+            temperatures = (
+                self.prepare_sample(seqs)
+                if self.rank == 0 and not skip_sampling
+                else None
             )
-        temperatures = (
-            self.prepare_sample(seqs)
-            if self.rank == 0 and not skip_sampling
-            else None
-        )
+            used_fast_path = False
+            if not is_prefill:
+                self._create_decode_context(
+                    mode="decode",
+                    requested_seqs=requested_seqs,
+                    execution_seqs=seqs,
+                    layer_states=layer_states,
+                    resident_states=resident_states,
+                    attention_metadata=attention_metadata,
+                    temperatures=temperatures,
+                )
         phase = "prefill" if is_prefill else "decode"
         with profile_range(f"qwen35_{phase}_model"):
             model_output = self.run_model(
@@ -639,15 +773,23 @@ class ModelRunner:
                 compute_logits=not skip_sampling,
                 attention_metadata=attention_metadata,
             )
-        self._finish_hybrid_state_batch(layer_states, resident_states)
+        if not used_fast_path:
+            self._finish_hybrid_state_batch(layer_states, resident_states)
         if skip_sampling:
             token_ids = [0] * len(seqs) if self.rank == 0 else None
             logits_cpu = None
         else:
             logits = model_output
-            token_ids = (
-                self.sampler(logits, temperatures).tolist()
+            sampled_tokens = (
+                self.sampler(logits, temperatures)
                 if self.rank == 0
+                else None
+            )
+            if sampled_tokens is not None and not is_prefill:
+                self._record_decode_sample(seqs, sampled_tokens)
+            token_ids = (
+                sampled_tokens.tolist()
+                if sampled_tokens is not None
                 else None
             )
             logits_cpu = (
@@ -683,27 +825,71 @@ class ModelRunner:
             raise RuntimeError(
                 "Unified mixed execution currently supports hybrid models only"
             )
-        with profile_range("qwen35_metadata_prepare_mixed"):
-            input_ids, positions, sample_seqs, _ = self.prepare_mixed(requests)
-            attention_metadata = self._build_hybrid_attention_metadata(
-                request_ids=[item.request_id for item in requests],
-                query_lens=[
-                    item.num_scheduled_tokens for item in requests
-                ],
-                is_prefilling=[item.is_prefill for item in requests],
-                positions=positions,
-            )
-
-        temperatures = (
-            self.prepare_sample(sample_seqs)
-            if self.rank == 0 and sample_seqs
+        seqs = [item.sequence for item in requests]
+        pure_decode = all(
+            not item.is_prefill
+            and item.num_scheduled_tokens == 1
+            and item.sample
+            for item in requests
+        )
+        fast_path = (
+            self._try_decode_fast_path(seqs, mode="unified_decode")
+            if pure_decode
             else None
         )
-        seqs = [item.sequence for item in requests]
-        _, layer_states, resident_states = self._prepare_hybrid_state_batch(
-            seqs,
-            allow_reorder=False,
-        )
+        if not pure_decode:
+            self._invalidate_decode_context("mixed_prefill")
+
+        if fast_path is not None:
+            (
+                execution_seqs,
+                layer_states,
+                input_ids,
+                positions,
+                attention_metadata,
+                temperatures,
+            ) = fast_path
+            if execution_seqs != seqs:
+                raise RuntimeError(
+                    "Unified decode fast path cannot reorder requests"
+                )
+            sample_seqs = seqs
+            resident_states = True
+            used_fast_path = True
+        else:
+            with profile_range("qwen35_metadata_prepare_mixed"):
+                input_ids, positions, sample_seqs, _ = self.prepare_mixed(requests)
+                attention_metadata = self._build_hybrid_attention_metadata(
+                    request_ids=[item.request_id for item in requests],
+                    query_lens=[
+                        item.num_scheduled_tokens for item in requests
+                    ],
+                    is_prefilling=[item.is_prefill for item in requests],
+                    positions=positions,
+                )
+
+            temperatures = (
+                self.prepare_sample(sample_seqs)
+                if self.rank == 0 and sample_seqs
+                else None
+            )
+            _, layer_states, resident_states = (
+                self._prepare_hybrid_state_batch(
+                    seqs,
+                    allow_reorder=False,
+                )
+            )
+            used_fast_path = False
+            if pure_decode:
+                self._create_decode_context(
+                    mode="unified_decode",
+                    requested_seqs=seqs,
+                    execution_seqs=seqs,
+                    layer_states=layer_states,
+                    resident_states=resident_states,
+                    attention_metadata=attention_metadata,
+                    temperatures=temperatures,
+                )
 
         with profile_range("qwen35_unified_model"):
             model_output = self.run_model(
@@ -714,14 +900,22 @@ class ModelRunner:
                 compute_logits=bool(sample_seqs),
                 attention_metadata=attention_metadata,
             )
-        self._finish_hybrid_state_batch(layer_states, resident_states)
+        if not used_fast_path:
+            self._finish_hybrid_state_batch(layer_states, resident_states)
 
         sampled_tokens = {}
         logits_cpu = None
         if sample_seqs:
-            token_ids = (
-                self.sampler(model_output, temperatures).tolist()
+            sampled_tokens = (
+                self.sampler(model_output, temperatures)
                 if self.rank == 0
+                else None
+            )
+            if sampled_tokens is not None and pure_decode:
+                self._record_decode_sample(seqs, sampled_tokens)
+            token_ids = (
+                sampled_tokens.tolist()
+                if sampled_tokens is not None
                 else None
             )
             if self.rank == 0:
@@ -746,6 +940,11 @@ class ModelRunner:
             "state_gather_calls": 0,
             "state_commit_calls": 0,
             "state_commit_skipped_calls": 0,
+            "decode_fast_path_hits": 0,
+            "decode_fast_path_normal_steps": 0,
+            "decode_fast_path_builds": 0,
+            "decode_fast_path_invalidations": 0,
+            "decode_fast_path_state_view_reuses": 0,
         }
         if getattr(self, "hybrid_state_manager", None) is not None:
             self.hybrid_state_manager.max_allocated_count = (
@@ -757,6 +956,7 @@ class ModelRunner:
         return dict(self.execution_stats)
 
     def release_states(self, seq_ids: list[int]):
+        self._invalidate_decode_context("state_release")
         if self.hybrid_cache_coordinator is not None:
             self.hybrid_cache_coordinator.free_requests(seq_ids)
 

@@ -79,6 +79,7 @@ class HybridStateManager:
         self.free_slots = deque(range(capacity)) if not compact_slots else None
         self.seq_to_slot: dict[int, int] = {}
         self.slot_to_seq: list[int | None] = [None] * capacity
+        self.mapping_version = 0
         self.max_allocated_count = 0
         self.state_bytes_per_sequence = sum(
             spec.bytes_per_sequence() for spec in specs
@@ -200,6 +201,7 @@ class HybridStateManager:
                 pool.conv_state[start:stop].zero_()
                 pool.recurrent_state[start:stop].zero_()
         if missing:
+            self.mapping_version += 1
             self._runtime_stats["allocation_calls"] += 1
             self._runtime_stats["allocation_rows"] += len(missing)
             zero_ops_per_layer = 2 if self.free_slots is None else 2 * len(missing)
@@ -212,10 +214,12 @@ class HybridStateManager:
         )
 
     def free(self, seq_ids: list[int]) -> None:
+        mapping_changed = False
         for seq_id in seq_ids:
             slot = self.seq_to_slot.pop(seq_id, None)
             if slot is None:
                 continue
+            mapping_changed = True
             if self.free_slots is not None:
                 self.slot_to_seq[slot] = None
                 self.free_slots.append(slot)
@@ -245,6 +249,8 @@ class HybridStateManager:
                     self._diagnostics["compaction_layer_ops"] += len(self.pools)
                     self._diagnostics["compaction_bytes"] += copied_bytes
             self.slot_to_seq[last_slot] = None
+        if mapping_changed:
+            self.mapping_version += 1
 
     def resident_order(self, seq_ids: list[int]) -> list[int] | None:
         """Return a slot-ordered request list when it forms one contiguous slice."""

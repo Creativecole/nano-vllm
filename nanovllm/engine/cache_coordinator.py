@@ -79,6 +79,10 @@ class HybridCacheCoordinator:
     def state_capacity(self) -> int:
         return self.delta_states.capacity
 
+    @property
+    def state_layout_version(self) -> int:
+        return self.delta_states.mapping_version
+
     def bind_model(self, model) -> None:
         model.enable_paged_attention()
         model.bind_paged_kv_states(self.paged_kv_states)

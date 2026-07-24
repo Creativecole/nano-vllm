@@ -8,6 +8,7 @@ from nanovllm.engine.layer_state import (
     HybridStateManager,
     delta_state_bytes_per_sequence,
 )
+from nanovllm.engine.cache_coordinator import HybridCacheCoordinator
 from nanovllm.engine.model_runner import ModelRunner
 
 
@@ -22,6 +23,12 @@ def make_spec(layer_idx=0):
         value_head_dim=8,
         conv_dtype=torch.bfloat16,
     )
+
+
+def make_coordinator(manager):
+    coordinator = HybridCacheCoordinator.__new__(HybridCacheCoordinator)
+    coordinator.delta_states = manager
+    return coordinator
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
@@ -71,6 +78,23 @@ def test_reused_slot_is_zeroed_and_does_not_leak_state():
     reused = manager.gather([2])[0]
     assert torch.count_nonzero(reused.conv_state) == 0
     assert torch.count_nonzero(reused.recurrent_state) == 0
+
+
+def test_mapping_version_changes_only_when_slot_layout_changes():
+    manager = HybridStateManager([make_spec()], capacity=3, device="cpu")
+    assert manager.mapping_version == 0
+
+    manager.allocate([10, 20])
+    assert manager.mapping_version == 1
+    manager.allocate([10, 20])
+    assert manager.mapping_version == 1
+
+    manager.free([999])
+    assert manager.mapping_version == 1
+    manager.free([10])
+    assert manager.mapping_version == 2
+    manager.allocate([30])
+    assert manager.mapping_version == 3
 
 
 def test_statecopy_mode_reuses_free_list_without_compaction():
@@ -229,6 +253,7 @@ def test_model_runner_orders_resident_batch_and_restores_outputs():
     manager.allocate([10, 20])
     runner = ModelRunner.__new__(ModelRunner)
     runner.hybrid_state_manager = manager
+    runner.hybrid_cache_coordinator = make_coordinator(manager)
     runner.config = SimpleNamespace(resident_deltanet_state=True)
     runner.execution_stats = {
         "state_resident_view_calls": 0,
@@ -265,9 +290,15 @@ def test_model_runner_orders_resident_batch_and_restores_outputs():
 
 
 def test_model_runner_can_disable_resident_state_for_ab_validation():
-    manager = HybridStateManager([make_spec()], capacity=4, device="cpu")
+    manager = HybridStateManager(
+        [make_spec()],
+        capacity=4,
+        device="cpu",
+        compact_slots=False,
+    )
     runner = ModelRunner.__new__(ModelRunner)
     runner.hybrid_state_manager = manager
+    runner.hybrid_cache_coordinator = make_coordinator(manager)
     runner.config = SimpleNamespace(resident_deltanet_state=False)
     runner.execution_stats = {
         "state_resident_view_calls": 0,

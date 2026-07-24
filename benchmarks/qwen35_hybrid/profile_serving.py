@@ -42,6 +42,8 @@ PROFILE_RANGES = (
     "qwen35_deltanet_output",
     "qwen35_mlp",
     "qwen35_metadata_prepare",
+    "qwen35_metadata_prepare_mixed",
+    "qwen35_decode_prepare_fast",
     "qwen35_state_resident_view",
     "qwen35_state_gather",
     "qwen35_state_commit",
@@ -81,6 +83,11 @@ def parse_args():
         "--disable-resident-deltanet-state",
         action="store_true",
         help="Profile the materialized state gather/commit fallback.",
+    )
+    parser.add_argument(
+        "--disable-decode-fast-path",
+        action="store_true",
+        help="Rebuild decode metadata and resident views on every step for A/B.",
     )
     parser.add_argument("--record-shapes", action="store_true")
     parser.add_argument("--profile-memory", action="store_true")
@@ -166,6 +173,15 @@ def summarize_profile(prof, wall_time_s: float):
         if not _is_cuda_event(event):
             continue
         name = str(getattr(event, "name", getattr(event, "key", "unknown")))
+        # record_function ranges also have device attribution, but they are
+        # parent annotations rather than leaf CUDA kernels. Counting both the
+        # range and its children inflates the kernel total several times over.
+        if (
+            name in PROFILE_RANGES
+            or name.startswith("qwen35_")
+            or name.startswith("driver_")
+        ):
+            continue
         duration_ms = _time_us(event, self_time=False) / 1000
         count = int(getattr(event, "count", 1) or 1)
         category = kernel_category(name)
@@ -379,6 +395,7 @@ def matrix_spec(args):
         "resident_deltanet_state": (
             not args.disable_resident_deltanet_state
         ),
+        "decode_fast_path": not args.disable_decode_fast_path,
     }
 
 
@@ -478,6 +495,7 @@ def profile_matrix(args, facts, spec, rows):
         max_model_len=max(prompt_lens) + max(decode_steps) + 1,
         max_num_batched_tokens=max(batch_sizes) * max(prompt_lens),
         resident_deltanet_state=not args.disable_resident_deltanet_state,
+        decode_fast_path=not args.disable_decode_fast_path,
         deltanet_backend=args.deltanet_backend,
         deltanet_chunk_size=args.deltanet_chunk_size,
     )
@@ -560,6 +578,7 @@ def run_target(args):
         max_model_len=args.target_prompt + args.target_decode + 1,
         max_num_batched_tokens=args.target_batch * args.target_prompt,
         resident_deltanet_state=not args.disable_resident_deltanet_state,
+        decode_fast_path=not args.disable_decode_fast_path,
         deltanet_backend=args.deltanet_backend,
         deltanet_chunk_size=args.deltanet_chunk_size,
     )
@@ -599,6 +618,10 @@ def derive_answers(rows):
             "state_commit_cuda_ms": 0.0,
             "state_commit_cpu_ms": 0.0,
             "state_resident_cpu_ms": 0.0,
+            "metadata_prepare_cpu_ms": 0.0,
+            "metadata_prepare_calls": 0,
+            "decode_fast_prepare_cpu_ms": 0.0,
+            "decode_fast_prepare_calls": 0,
             "recurrence_cuda_ms": 0.0,
             "recurrence_calls": 0,
         }
@@ -640,6 +663,25 @@ def derive_answers(rows):
         phase_total["state_resident_cpu_ms"] += ranges.get(
             "qwen35_state_resident_view", {}
         ).get("cpu_total_ms", 0.0)
+        for range_name in (
+            "qwen35_metadata_prepare",
+            "qwen35_metadata_prepare_mixed",
+        ):
+            prepare = ranges.get(range_name, {})
+            phase_total["metadata_prepare_cpu_ms"] += prepare.get(
+                "cpu_total_ms",
+                0.0,
+            )
+            phase_total["metadata_prepare_calls"] += prepare.get("calls", 0)
+        fast_prepare = ranges.get("qwen35_decode_prepare_fast", {})
+        phase_total["decode_fast_prepare_cpu_ms"] += fast_prepare.get(
+            "cpu_total_ms",
+            0.0,
+        )
+        phase_total["decode_fast_prepare_calls"] += fast_prepare.get(
+            "calls",
+            0,
+        )
         phase_total["recurrence_cuda_ms"] += recurrence.get("cuda_total_ms", 0.0)
         phase_total["recurrence_calls"] += recurrence.get("calls", 0)
         trend_rows.append(
@@ -864,6 +906,8 @@ def render_markdown(payload):
             "state gather CUDA ms",
             "state commit CUDA ms",
             "resident state view CPU ms",
+            "normal prepare CPU ms/calls",
+            "fast prepare CPU ms/calls",
             "recurrence us/call",
         ],
         [
@@ -878,6 +922,14 @@ def render_markdown(payload):
                 row["state_gather_cuda_ms"],
                 row["state_commit_cuda_ms"],
                 row["state_resident_cpu_ms"],
+                (
+                    f"{row['metadata_prepare_cpu_ms']:.3f}/"
+                    f"{row['metadata_prepare_calls']}"
+                ),
+                (
+                    f"{row['decode_fast_prepare_cpu_ms']:.3f}/"
+                    f"{row['decode_fast_prepare_calls']}"
+                ),
                 row["recurrence_avg_us"],
             ]
             for row in answers["phase_summary"]
@@ -891,8 +943,8 @@ Completed cases: `{payload.get('completed_cases', len(payload['profiles']))}` / 
 
 This report separates additive CUDA kernel self-time from high-level operator/range
 attribution. Range percentages describe model components and may contain child kernels;
-kernel category percentages use CUDA device events and are the better low-level target
-signal.
+kernel category percentages use leaf CUDA device events after excluding high-level
+`qwen35_*` and driver annotations, and are the better low-level target signal.
 
 ## Phase Summary
 
