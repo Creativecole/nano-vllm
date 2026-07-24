@@ -4,6 +4,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from nanovllm.attention import HybridAttentionMetadata
+from nanovllm.attention.backend import (
+    create_attention_backend,
+    get_attention_backend_registration,
+)
 from nanovllm.engine.layer_state import (
     DeltaNetState,
     DeltaNetStateSpec,
@@ -247,6 +252,7 @@ class Qwen3_5Attention(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
+        runtime_metadata=None,
     ) -> torch.Tensor:
         if hidden_states.ndim == 2:
             if self.paged_attention is None:
@@ -267,7 +273,16 @@ class Qwen3_5Attention(nn.Module):
             query, key = apply_partial_rotary_pos_emb(
                 query, key, *position_embeddings
             )
-            output = self.paged_attention(query, key, value)
+            if runtime_metadata is None:
+                # Preserve the legacy/reference backend ABI during migration.
+                output = self.paged_attention(query, key, value)
+            else:
+                output = self.paged_attention(
+                    query,
+                    key,
+                    value,
+                    metadata=runtime_metadata,
+                )
             if output.ndim == 4:
                 output = output.squeeze(1)
             output = output.reshape(num_tokens, self.num_heads * self.head_dim)
@@ -572,16 +587,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         decay: torch.Tensor,
         beta: torch.Tensor,
         initial_state: torch.Tensor | None = None,
+        is_prefill: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         use_chunked = self.deltanet_backend == "chunked" and query.shape[1] > 1
         backend = "chunked" if use_chunked else "sequential"
         if self._diagnostics_enabled:
-            context = get_context()
+            if is_prefill is None:
+                is_prefill = get_context().is_prefill
             self._diagnostics["recurrence_calls"] += 1
             self._diagnostics["calls"].append(
                 {
                     "backend": backend,
-                    "is_prefill": context.is_prefill,
+                    "is_prefill": is_prefill,
                     "query_shape": list(query.shape),
                     "key_shape": list(key.shape),
                     "value_shape": list(value.shape),
@@ -618,6 +635,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         layer_state: DeltaNetState,
+        *,
+        is_prefill: bool,
     ) -> torch.Tensor:
         # hidden_states: [batch, seq_len, hidden_size]
         batch_size, seq_len, _ = hidden_states.shape
@@ -659,6 +678,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             decay,
             beta,
             initial_state=layer_state.recurrent_state,
+            is_prefill=is_prefill,
         )
         layer_state.recurrent_state.copy_(final_state)
         with profile_range("qwen35_deltanet_output"):
@@ -674,8 +694,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self,
         hidden_states: torch.Tensor,
         layer_state: DeltaNetState,
+        runtime_metadata=None,
     ) -> torch.Tensor:
-        context = get_context()
+        context = runtime_metadata if runtime_metadata is not None else get_context()
         if context.is_mixed:
             if context.sequence_query_lens is None:
                 raise RuntimeError("Mixed DeltaNet execution is missing query lengths")
@@ -704,6 +725,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     self._forward_stateful_chunk(
                         decode_hidden,
                         decode_state,
+                        is_prefill=False,
                     ).squeeze(1)
                 )
 
@@ -724,7 +746,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                         prefill_hidden.shape[-1],
                     )
                     outputs.append(
-                        self._forward_stateful_chunk(batched, prefill_state).reshape(
+                        self._forward_stateful_chunk(
+                            batched,
+                            prefill_state,
+                            is_prefill=True,
+                        ).reshape(
                             -1, prefill_hidden.shape[-1]
                         )
                     )
@@ -745,6 +771,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                             self._forward_stateful_chunk(
                                 chunk.unsqueeze(0),
                                 request_state,
+                                is_prefill=True,
                             ).squeeze(0)
                         )
                     outputs.append(torch.cat(per_request_outputs, dim=0))
@@ -773,7 +800,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 batched = hidden_states.reshape(
                     batch_size, seq_len, hidden_states.shape[-1]
                 )
-                output = self._forward_stateful_chunk(batched, layer_state)
+                output = self._forward_stateful_chunk(
+                    batched,
+                    layer_state,
+                    is_prefill=True,
+                )
                 return output.reshape(-1, output.shape[-1])
 
             if self._diagnostics_enabled:
@@ -787,10 +818,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     conv_state=layer_state.conv_state[batch_idx : batch_idx + 1],
                     recurrent_state=layer_state.recurrent_state[batch_idx : batch_idx + 1],
                 )
-                output = self._forward_stateful_chunk(chunk.unsqueeze(0), request_state)
+                output = self._forward_stateful_chunk(
+                    chunk.unsqueeze(0),
+                    request_state,
+                    is_prefill=True,
+                )
                 outputs.append(output.squeeze(0))
             return torch.cat(outputs, dim=0)
-        output = self._forward_stateful_chunk(hidden_states.unsqueeze(1), layer_state)
+        output = self._forward_stateful_chunk(
+            hidden_states.unsqueeze(1),
+            layer_state,
+            is_prefill=False,
+        )
         return output.squeeze(1)
 
     def forward(
@@ -799,11 +838,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         attention_mask: torch.Tensor | None = None,
         return_state: bool = False,
         layer_state: DeltaNetState | None = None,
+        runtime_metadata=None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if layer_state is not None:
             if hidden_states.ndim != 2:
                 raise ValueError("Stateful DeltaNet expects packed/decode rank-2 hidden states")
-            return self._forward_packed(hidden_states, layer_state)
+            return self._forward_packed(
+                hidden_states,
+                layer_state,
+                runtime_metadata=runtime_metadata,
+            )
         # hidden_states: [batch, seq_len, hidden_size]
         if attention_mask is not None and attention_mask.ndim == 2:
             hidden_states = hidden_states * attention_mask.to(hidden_states.dtype).unsqueeze(-1)
@@ -865,19 +909,28 @@ class Qwen3_5DecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.block_type = config.layer_types[layer_idx]
-        if self.block_type == "linear_attention":
-            self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
-        elif self.block_type == "full_attention":
-            self.self_attn = Qwen3_5Attention(config, layer_idx)
-        else:
+        mixer_classes = {
+            "linear_attention": Qwen3_5GatedDeltaNet,
+            "full_attention": Qwen3_5Attention,
+        }
+        mixer_cls = mixer_classes.get(self.block_type)
+        if mixer_cls is None:
             raise ValueError(
                 f"Unsupported Qwen3.5 layer type {self.block_type!r} at layer {layer_idx}"
             )
+        registration = get_attention_backend_registration(self.block_type)
+        self.mixer_attr = registration.module_attr
+        self.add_module(self.mixer_attr, mixer_cls(config, layer_idx))
+        self.attention_backend = create_attention_backend(self.block_type)
         self.mlp = Qwen3_5MLP(config)
         self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+
+    @property
+    def mixer(self):
+        return getattr(self, self.mixer_attr)
 
     def forward(
         self,
@@ -885,23 +938,24 @@ class Qwen3_5DecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
         layer_state: DeltaNetState | None = None,
+        attention_metadata: HybridAttentionMetadata | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        if self.block_type == "linear_attention":
-            with profile_range("qwen35_deltanet_mixer"):
-                hidden_states = self.linear_attn(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    layer_state=layer_state,
-                )
-        else:
-            with profile_range("qwen35_full_attention_mixer"):
-                hidden_states = self.self_attn(
-                    hidden_states,
-                    position_embeddings=position_embeddings,
-                    attention_mask=attention_mask,
-                )
+        backend_metadata = (
+            attention_metadata.for_layer_type(self.block_type)
+            if attention_metadata is not None
+            else None
+        )
+        with profile_range(self.attention_backend.profile_range_name):
+            hidden_states = self.attention_backend.forward(
+                self.mixer,
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                layer_state=layer_state,
+                metadata=backend_metadata,
+            )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -934,19 +988,21 @@ class Qwen3_5Model(nn.Module):
 
     def set_deltanet_diagnostics(self, enabled: bool, reset: bool = True) -> None:
         for layer in self.layers:
-            if layer.block_type == "linear_attention":
-                layer.linear_attn.set_diagnostics(enabled, reset=reset)
+            set_diagnostics = getattr(layer.mixer, "set_diagnostics", None)
+            if set_diagnostics is not None:
+                set_diagnostics(enabled, reset=reset)
 
     def reset_deltanet_diagnostics(self) -> None:
         for layer in self.layers:
-            if layer.block_type == "linear_attention":
-                layer.linear_attn.reset_diagnostics()
+            reset_diagnostics = getattr(layer.mixer, "reset_diagnostics", None)
+            if reset_diagnostics is not None:
+                reset_diagnostics()
 
     def get_deltanet_diagnostics(self) -> dict[int, dict[str, object]]:
         return {
-            layer.layer_idx: layer.linear_attn.get_diagnostics()
+            layer.layer_idx: layer.mixer.get_diagnostics()
             for layer in self.layers
-            if layer.block_type == "linear_attention"
+            if hasattr(layer.mixer, "get_diagnostics")
         }
 
     def _normalize_positions(
@@ -977,6 +1033,7 @@ class Qwen3_5Model(nn.Module):
         positions: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         layer_states: dict[int, DeltaNetState] | None = None,
+        attention_metadata: HybridAttentionMetadata | None = None,
     ) -> torch.Tensor:
         if layer_states is not None:
             if input_ids.ndim != 1 or positions is None or positions.ndim != 1:
@@ -990,6 +1047,7 @@ class Qwen3_5Model(nn.Module):
                     hidden_states,
                     position_embeddings=position_embeddings,
                     layer_state=layer_states.get(layer.layer_idx),
+                    attention_metadata=attention_metadata,
                 )
             return self.norm(hidden_states)
 
@@ -1007,6 +1065,7 @@ class Qwen3_5Model(nn.Module):
                 hidden_states,
                 position_embeddings=position_embeddings,
                 attention_mask=attention_mask,
+                attention_metadata=attention_metadata,
             )
         hidden_states = self.norm(hidden_states)
         return hidden_states.squeeze(0) if squeeze_batch else hidden_states
@@ -1047,8 +1106,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         positions: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         layer_states: dict[int, DeltaNetState] | None = None,
+        attention_metadata: HybridAttentionMetadata | None = None,
     ) -> torch.Tensor:
-        return self.model(input_ids, positions, attention_mask, layer_states)
+        return self.model(
+            input_ids,
+            positions,
+            attention_mask,
+            layer_states,
+            attention_metadata,
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         context = get_context()
@@ -1071,43 +1137,23 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def get_layer_state_specs(self) -> list[PagedKVStateSpec | DeltaNetStateSpec]:
         parameter_dtype = self.model.embed_tokens.weight.dtype
-        specs = []
-        for layer in self.model.layers:
-            if layer.block_type == "full_attention":
-                specs.append(
-                    PagedKVStateSpec(
-                        layer_idx=layer.layer_idx,
-                        layer_type=layer.block_type,
-                        num_kv_heads=layer.self_attn.num_kv_heads,
-                        head_dim=layer.self_attn.head_dim,
-                        dtype=parameter_dtype,
-                    )
-                )
-            else:
-                mixer = layer.linear_attn
-                specs.append(
-                    DeltaNetStateSpec(
-                        layer_idx=layer.layer_idx,
-                        layer_type=layer.block_type,
-                        conv_dim=mixer.conv_dim,
-                        conv_width=mixer.conv_kernel_size,
-                        num_value_heads=mixer.num_v_heads,
-                        key_head_dim=mixer.head_k_dim,
-                        value_head_dim=mixer.head_v_dim,
-                        conv_dtype=parameter_dtype,
-                    )
-                )
-        return specs
+        return [
+            layer.attention_backend.get_state_spec(
+                layer.mixer,
+                parameter_dtype,
+            )
+            for layer in self.model.layers
+        ]
 
     def enable_paged_attention(self) -> None:
         for layer in self.model.layers:
-            if layer.block_type == "full_attention":
-                layer.self_attn.enable_paged_attention()
+            layer.attention_backend.enable_runtime(layer.mixer)
 
     def bind_paged_kv_states(self, states: dict[int, PagedKVState]) -> None:
         for layer in self.model.layers:
-            if layer.block_type == "full_attention":
-                layer.self_attn.bind_paged_state(states[layer.layer_idx])
+            state = states.get(layer.layer_idx)
+            if state is not None:
+                layer.attention_backend.bind_state(layer.mixer, state)
 
     def forward_logits(
         self,

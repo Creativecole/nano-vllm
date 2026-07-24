@@ -4,13 +4,13 @@ import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
+from nanovllm.attention import HybridAttentionMetadataBuilder
 from nanovllm.config import Config
+from nanovllm.engine.cache_coordinator import HybridCacheCoordinator
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import ScheduledRequest
 from nanovllm.engine.layer_state import (
     DeltaNetStateSpec,
-    HybridStateManager,
-    PagedKVState,
     delta_state_bytes_per_sequence,
     paged_kv_bytes_per_block,
 )
@@ -56,6 +56,10 @@ class ModelRunner:
         self.is_hybrid = any(
             isinstance(spec, DeltaNetStateSpec) for spec in self.layer_state_specs
         )
+        self.attention_metadata_builder = (
+            HybridAttentionMetadataBuilder() if self.is_hybrid else None
+        )
+        self.hybrid_cache_coordinator = None
         self.hybrid_state_manager = None
         if self.is_hybrid:
             if self.world_size != 1:
@@ -87,7 +91,16 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        if hasattr(self, "model"):
+            del self.model
+        if hasattr(self, "kv_cache"):
+            del self.kv_cache
+        self.hybrid_cache_coordinator = None
+        self.hybrid_state_manager = None
+        reset_context()
+        torch.cuda.empty_cache()
 
     def loop(self):
         while True:
@@ -160,11 +173,15 @@ class ModelRunner:
 
     def allocate_hybrid_cache(self):
         config = self.config
+        # Hybrid allocation has no warmup peak to reserve. Release cached blocks
+        # from a previous runtime in the same process and budget from live usage.
+        torch.cuda.empty_cache()
         free, total = torch.cuda.mem_get_info()
         used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        available = int(total * config.gpu_memory_utilization - used - peak + current)
+        available = min(
+            free,
+            int(total * config.gpu_memory_utilization - used),
+        )
         state_bytes = delta_state_bytes_per_sequence(self.layer_state_specs)
         block_bytes = paged_kv_bytes_per_block(
             self.layer_state_specs, self.block_size
@@ -191,49 +208,27 @@ class ModelRunner:
                 f"state_bytes_per_sequence={state_bytes}, kv_block_bytes={block_bytes}"
             )
 
-        delta_specs = [
-            spec
-            for spec in self.layer_state_specs
-            if isinstance(spec, DeltaNetStateSpec)
-        ]
-        self.hybrid_state_manager = HybridStateManager(
-            delta_specs,
-            capacity=state_capacity,
+        coordinator = HybridCacheCoordinator(
+            self.layer_state_specs,
+            state_capacity=state_capacity,
+            num_kv_blocks=num_blocks,
+            block_size=self.block_size,
             device=torch.device("cuda", self.rank),
-            compact_slots=config.resident_deltanet_state,
+            compact_delta_slots=config.resident_deltanet_state,
         )
-        paged_states = {}
-        for spec in self.layer_state_specs:
-            if isinstance(spec, DeltaNetStateSpec):
-                continue
-            paged_states[spec.layer_idx] = PagedKVState(
-                layer_idx=spec.layer_idx,
-                k_cache=torch.empty(
-                    num_blocks,
-                    self.block_size,
-                    spec.num_kv_heads,
-                    spec.head_dim,
-                    dtype=spec.dtype,
-                    device=torch.device("cuda", self.rank),
-                ),
-                v_cache=torch.empty(
-                    num_blocks,
-                    self.block_size,
-                    spec.num_kv_heads,
-                    spec.head_dim,
-                    dtype=spec.dtype,
-                    device=torch.device("cuda", self.rank),
-                ),
-            )
-        self.model.enable_paged_attention()
-        self.model.bind_paged_kv_states(paged_states)
+        coordinator.bind_model(self.model)
+        self.hybrid_cache_coordinator = coordinator
+        # Compatibility alias for existing diagnostics and serving benchmarks.
+        self.hybrid_state_manager = coordinator.delta_states
         config.max_num_seqs = min(config.max_num_seqs, state_capacity)
         config.num_kvcache_blocks = int(num_blocks)
+        cache_stats = coordinator.get_stats()
         print(
             "Hybrid cache: "
             f"state_slots={state_capacity}, state_bytes_per_sequence={state_bytes}, "
-            f"kv_blocks={num_blocks}, full_attention_layers={len(paged_states)}, "
-            f"deltanet_layers={len(delta_specs)}",
+            f"kv_blocks={num_blocks}, "
+            f"full_attention_layers={cache_stats['full_attention_layers']}, "
+            f"deltanet_layers={cache_stats['deltanet_layers']}",
             flush=True,
         )
 
@@ -475,9 +470,15 @@ class ModelRunner:
         is_prefill: bool,
         layer_states=None,
         compute_logits: bool = True,
+        attention_metadata=None,
     ):
         if layer_states is not None:
-            hidden_states = self.model(input_ids, positions, layer_states=layer_states)
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                layer_states=layer_states,
+                attention_metadata=attention_metadata,
+            )
             return (
                 self.model.compute_logits(hidden_states)
                 if compute_logits
@@ -507,39 +508,50 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    def _build_hybrid_attention_metadata(
+        self,
+        *,
+        request_ids: list[int],
+        query_lens: list[int],
+        is_prefilling: list[bool],
+        positions: torch.Tensor,
+    ):
+        if not self.is_hybrid:
+            return None
+        return self.attention_metadata_builder.build(
+            context=get_context(),
+            request_ids=request_ids,
+            query_lens=query_lens,
+            is_prefilling=is_prefilling,
+            positions=positions,
+        )
+
     def _prepare_hybrid_state_batch(
         self,
         seqs: list[Sequence],
         *,
         allow_reorder: bool,
     ) -> tuple[list[Sequence], dict | None, bool]:
-        manager = self.hybrid_state_manager
-        if manager is None:
+        coordinator = self.hybrid_cache_coordinator
+        if coordinator is None:
             return seqs, None, False
 
         requested_ids = [seq.seq_id for seq in seqs]
-        manager.allocate(requested_ids)
-        if not self.config.resident_deltanet_state:
-            with profile_range("qwen35_state_gather"):
-                layer_states = manager.gather(requested_ids)
-            self.execution_stats["state_gather_calls"] += 1
-            return seqs, layer_states, False
-
-        resident_ids = manager.resident_order(requested_ids)
-        if resident_ids is not None and (
-            allow_reorder or resident_ids == requested_ids
-        ):
-            seq_by_id = {seq.seq_id: seq for seq in seqs}
-            ordered_seqs = [seq_by_id[seq_id] for seq_id in resident_ids]
-            with profile_range("qwen35_state_resident_view"):
-                layer_states = manager.resident(resident_ids)
+        execution_ids, layer_states, is_resident = (
+            coordinator.prepare_request_batch(
+                requested_ids,
+                allow_reorder=allow_reorder,
+            )
+        )
+        if is_resident:
             self.execution_stats["state_resident_view_calls"] += 1
-            return ordered_seqs, layer_states, True
-
-        with profile_range("qwen35_state_gather"):
-            layer_states = manager.gather(requested_ids)
-        self.execution_stats["state_gather_calls"] += 1
-        return seqs, layer_states, False
+        else:
+            self.execution_stats["state_gather_calls"] += 1
+        if execution_ids == requested_ids:
+            return seqs, layer_states, is_resident
+        seq_by_id = {seq.seq_id: seq for seq in seqs}
+        ordered_seqs = [seq_by_id[seq_id] for seq_id in execution_ids]
+        return ordered_seqs, layer_states, is_resident
 
     @staticmethod
     def _restore_request_order(
@@ -564,12 +576,13 @@ class ModelRunner:
     ) -> None:
         if layer_states is None:
             return
-        if is_resident:
-            self.hybrid_state_manager.finish_resident(layer_states)
+        committed = self.hybrid_cache_coordinator.finish_request_batch(
+            layer_states,
+            is_resident=is_resident,
+        )
+        if not committed:
             self.execution_stats["state_commit_skipped_calls"] += 1
             return
-        with profile_range("qwen35_state_commit"):
-            self.hybrid_state_manager.commit(layer_states)
         self.execution_stats["state_commit_calls"] += 1
 
     def run(
@@ -602,6 +615,15 @@ class ModelRunner:
                 if is_prefill
                 else self.prepare_decode(seqs)
             )
+            attention_metadata = self._build_hybrid_attention_metadata(
+                request_ids=[seq.seq_id for seq in seqs],
+                query_lens=[
+                    seq.num_scheduled_tokens if is_prefill else 1
+                    for seq in seqs
+                ],
+                is_prefilling=[is_prefill] * len(seqs),
+                positions=positions,
+            )
         temperatures = (
             self.prepare_sample(seqs)
             if self.rank == 0 and not skip_sampling
@@ -615,6 +637,7 @@ class ModelRunner:
                 is_prefill,
                 layer_states,
                 compute_logits=not skip_sampling,
+                attention_metadata=attention_metadata,
             )
         self._finish_hybrid_state_batch(layer_states, resident_states)
         if skip_sampling:
@@ -662,6 +685,14 @@ class ModelRunner:
             )
         with profile_range("qwen35_metadata_prepare_mixed"):
             input_ids, positions, sample_seqs, _ = self.prepare_mixed(requests)
+            attention_metadata = self._build_hybrid_attention_metadata(
+                request_ids=[item.request_id for item in requests],
+                query_lens=[
+                    item.num_scheduled_tokens for item in requests
+                ],
+                is_prefilling=[item.is_prefill for item in requests],
+                positions=positions,
+            )
 
         temperatures = (
             self.prepare_sample(sample_seqs)
@@ -681,6 +712,7 @@ class ModelRunner:
                 True,
                 layer_states,
                 compute_logits=bool(sample_seqs),
+                attention_metadata=attention_metadata,
             )
         self._finish_hybrid_state_batch(layer_states, resident_states)
 
@@ -725,8 +757,8 @@ class ModelRunner:
         return dict(self.execution_stats)
 
     def release_states(self, seq_ids: list[int]):
-        if self.hybrid_state_manager is not None:
-            self.hybrid_state_manager.free(seq_ids)
+        if self.hybrid_cache_coordinator is not None:
+            self.hybrid_cache_coordinator.free_requests(seq_ids)
 
     def set_deltanet_diagnostics(
         self, enabled: bool, reset: bool = True

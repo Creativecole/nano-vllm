@@ -167,6 +167,28 @@ Qwen3.5-9B text configuration:
 - Hidden size 4096, MLP intermediate size 12288
 - BF16 model tensors with FP32 recurrent-state accumulation
 
+### Hybrid Attention Runtime
+
+The runtime separates scheduling, state ownership, metadata construction, and
+layer execution:
+
+```text
+SchedulerOutput
+  -> ModelRunner
+     -> HybridAttentionMetadataBuilder
+     -> HybridCacheCoordinator
+     -> Qwen3.5 DecoderLayer
+        -> AttentionBackendRegistry
+           -> FullAttentionBackend
+           -> DeltaNetBackend
+```
+
+`Scheduler` still owns token budgets and paged-KV admission. `HybridCacheCoordinator`
+owns the physical paged-KV tensors and request-scoped DeltaNet state slots.
+`HybridAttentionMetadataBuilder` converts one execution step into typed full-attention
+and DeltaNet metadata. Decoder layers bind their backend once during construction, so
+the forward path no longer contains a model-specific Full Attention/DeltaNet branch.
+
 ### Hybrid Cache
 
 Full Attention layers use nano-vLLM's paged KV blocks and block tables. DeltaNet layers

@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from nanovllm.utils.context import get_context
 
@@ -60,6 +61,52 @@ def error_metrics(actual, expected):
 
 
 def use_transformers_recurrent_reference(modeling, linear_attention):
+    class RMSNormGatedReference(torch.nn.Module):
+        def __init__(self, fused_norm):
+            super().__init__()
+            self.weight = fused_norm.weight
+            self.eps = getattr(
+                fused_norm,
+                "eps",
+                getattr(fused_norm, "variance_epsilon", 1e-6),
+            )
+
+        def forward(self, hidden_states, gate):
+            input_dtype = hidden_states.dtype
+            normalized = hidden_states.float()
+            normalized = normalized * torch.rsqrt(
+                normalized.pow(2).mean(dim=-1, keepdim=True) + self.eps
+            )
+            weight = self.weight.to(
+                device=hidden_states.device,
+                dtype=input_dtype,
+            )
+            normalized = weight * normalized.to(input_dtype)
+            return (normalized * F.silu(gate.float())).to(input_dtype)
+
+    def causal_conv1d_reference(
+        x,
+        weight,
+        bias=None,
+        activation=None,
+        **_kwargs,
+    ):
+        # The optional causal-conv1d package only implements CUDA dispatch. Keep
+        # tiny CPU comparisons on the official grouped-convolution math.
+        sequence_length = x.shape[-1]
+        output = F.conv1d(
+            x.to(weight.dtype),
+            weight.unsqueeze(1),
+            bias=bias,
+            padding=weight.shape[-1] - 1,
+            groups=x.shape[1],
+        )[..., :sequence_length]
+        if activation in ("silu", "swish"):
+            output = F.silu(output)
+        elif activation is not None:
+            raise ValueError(f"Unsupported causal convolution activation: {activation}")
+        return output.to(x.dtype)
+
     def recurrent_chunk(
         query,
         key,
@@ -82,7 +129,9 @@ def use_transformers_recurrent_reference(modeling, linear_attention):
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
 
+    linear_attention.causal_conv1d_fn = causal_conv1d_reference
     linear_attention.chunk_gated_delta_rule = recurrent_chunk
+    linear_attention.norm = RMSNormGatedReference(linear_attention.norm)
 
 
 class TorchPagedAttentionReference(torch.nn.Module):
